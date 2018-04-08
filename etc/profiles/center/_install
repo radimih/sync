@@ -1,0 +1,24 @@
+#!/bin/sh
+
+syncctl system install
+
+# Таблицы для отправки в филиалы
+
+# -- Справочники
+
+syncctl table add oc2.tEmitentsGT
+syncctl table add oc2.tMarketGT
+syncctl table add oc2.tTownGT
+syncctl table add oc2.tAZSGT
+
+# -- Карты
+
+syncctl table add mcc.Cards
+syncctl table add oc2.tTranzitCardsGT
+syncctl table dwatch-off mcc.Cards
+syncctl table dwatch-off oc2.tTranzitCardsGT
+
+# -- Транзакции
+
+syncctl table add mcc.TransactionsLog
+syncctl table dwatch-off mcc.TransactionsLog

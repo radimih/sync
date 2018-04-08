@@ -1,0 +1,1076 @@
+#!/bin/sh
+#
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Система синхронизации - управляющий скрипт
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+#
+# Примечание:
+#
+#   В целом, скрипт не зависит от СУБД. Все SQL-выражения и
+#   функция sql_valuelist описаны в файле $SQL_RDBMS.sql.
+#
+######################################################################
+#
+#ifdef __USAGE
+#%C - 
+#
+#%C <объект> <действие> [<опции>]
+#
+#Объекты:
+#
+#  system   - система синхронизации в целом
+#  keyring  - ключи системы
+#  node     - удаленный узел (узел, который будет получать данные)
+#  table    - синхронизируемая таблица
+#  data     - данные синхронизации
+#  prepared - номер последнего успешно сформированного пакета
+#  updated  - номер последнего успешно обработанного пакета
+#
+#Действия над объектом system:
+#
+#  install     - установить систему в базе данных
+#  uninstall   - убрать из базы все, что относится к системе
+#  update      - обновить систему в базе данных
+#  status      - вывести данные о системе (версия, узлы, таблицы) 
+#  reset-cache - сбросить все кэшированные SQL-скрипты
+#
+#Действия над объектом keyring:
+#
+#  make            - создать первичную пару ключей для данного узла
+#  make for <узел> - создать первичную пару ключей для узла <узел>
+#  add <узел>.key  - добавить открытый ключ узла в кольцо доверия
+#  remove <узел>   - удалить открытый ключ узла из кольца доверия
+#  list            - вывести список открытых ключей
+#  export          - выгрузить свой открытый ключ в файл <узел>.key  
+#
+#Действия над объектом node:
+#
+#  add <название узла>      - добавить узел в систему
+#  remove <название узла>   - убрать узел из системы
+#  reset <название узла>    - начать заново формирование исходящих пакетов
+#  list                     - вывести список узлов, зарегистрированных
+#                             в системе
+#
+#Действия над объектом table:
+#
+#  add <имя таблицы>        - сделать записи таблицы тиражируемые на узлы 
+#  update <имя таблицы>     - обновить метаданные таблицы для тиражирования 
+#  remove <имя таблицы>     - прикратить тиражировать записи таблицы
+#  dwatch-on <имя таблицы>  - включить слежение за удалением записей таблицы
+#  dwatch-off <имя таблицы> - выключить слежение за удалением записей таблицы
+#
+#Действия над объектом data:
+#
+#  prepare [for <group>]    - подготовить данные для отправки на узел/узлы
+#  update from <group>      - обновить БД данными, пришедшими с узла/узлов
+#
+#  где <group> - название группы узлов или конкретного узла
+#
+#Действия над объектом prepared:
+#
+# get for <node>       - вернуть номер последнего успешно сформированного пакета
+# set <num> for <node> - установить номер последнего успешно сформированного
+#                        пакета
+#
+#Действия над объектом updated:
+#
+# get for <node>       - вернуть номер последнего успешно обработанного пакета
+# set <num> for <node> - установить номер последнего успешно обработанного
+#                        пакета
+#
+#Примечание:
+#  Скрипт использует файл настройки sync.conf
+#
+#endif
+#
+
+if [ $# -lt 2 ]
+then
+	/bin/use $0
+	exit 1
+fi
+
+set -q
+
+# ********************************************************************
+# Global settings
+
+. `dirname $0`/etc/common
+. `dirname $0`/etc/sync.conf
+
+# ********************************************************************
+# SQL settings
+
+. `dirname $0`/etc/$SQL_RDBMS.sql
+
+# ********************************************************************
+# Local settings
+
+SCRIPT_NAME=`basename $0` # Имя скрипта. Используется для
+                          # отображения имени скрипта в
+                          # сообщениях лога 
+
+LOCAL_NODE=$NODENAME      # название локального узла. Используется на
+                          # удаленном узле в качестве идентификатора
+                          # в БД и как название каталога данных,
+                          # относящихся к этому локальному узлу.
+
+process_full=$0
+process_name=`basename $0`
+process_number=$$
+
+# Списки объектов и действий над ними, допустимые для
+# указания в командной строке
+
+list_object="system keyring node table data prepared updated"
+list_system_action="install uninstall update status reset-cache"
+list_keyring_action="make add remove list export"
+list_node_action="add remove list reset"
+list_table_action="add update remove dwatch-on dwatch-off"
+list_data_action="prepare update"
+list_prepared_action="get set"
+list_updated_action="get set"
+
+SQL_ERROR="SQL_ERROR" # специальное значение, возвращаемое функцией
+                      # sql_valuelist, сигнализируещее о произошедшей
+                      # ошибке.
+
+ERROR_BUSY=2      # Код ошибки "Выполняется аналогичная команда"
+ERROR_STR="ERROR" # Код ошибки для функций, возвращающих строковое значение
+RETURN_SKIP=-1    # Код возврата "Игнорировать пакет"
+
+# ********************************************************************
+# main - Главная процедура, с которой начинается выполнение скрипта
+# ----
+# Проверяет правильность задания аргументов скрипта и вызывает
+# соответствующую им процедуру.
+# 
+# Параметры:
+#   object  - имя объекта 
+#   action  - действие над объектом 
+#   options - дополнительные опции
+
+main()
+{
+  typeset object action options action_list
+
+  object=$1
+  action=$2
+  shift 2
+  options=$*
+
+  # Проверить, задан ли параметр NODENAME в sync.conf
+
+  if [ -z "$NODENAME" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Не задано название данного узла (параметр NODENAME в sync.conf)"
+    return 999
+  fi
+
+  # Проверить правильность задания объекта в командной строке
+
+  if inlist "$object" "$list_object"
+  then
+    true # Такая странная конструкция обусловленна невозможностью
+         # в первом приближении инвертировать результат функции
+  else
+    logmsg $ST_ERR 1 1 $0 "Неизвестный тип объекта \"$object\""
+    return 999
+  fi
+
+  # Проверить правильность задания действия над объектом в командной строке
+
+  action_list="\$list_${object}_action"
+  action_list=`eval echo $action_list`
+
+  if inlist "$action" "$action_list"
+  then
+    true
+  else
+    logmsg $ST_ERR 1 1 $0 "Недопустимое действие \"$action\" над объектом \"$object\""
+    return 999
+  fi
+
+  # Проверить на недопустимость параллельного выполнения нескольких
+  # команд с объектом data.
+  # !!! Иногда происходит ложное срабатывание
+
+#  if [ "$object" = "data" ]
+#  then
+#    if [ -n "`ps -a | grep -v "READY" | grep -v grep | grep -v "^ *$process_number" | grep "$process_full data"`" ]
+#    then
+#      logmsg $ST_WARN 1 1 "" "В памяти исполняется другой экземпляр программы \"$process_name\". Досрочное завершение этого экземпляра"
+#      return $ERROR_BUSY
+#    fi
+#  fi
+
+  # Удалить все временные файлы системы
+
+  rm -f $PATH_TEMP/* 2> /dev/null
+
+  # Вызвать процедуру обработки заданной команды
+
+  cmd="${object}_${action}"
+  logmsg $ST_INFO 3 0 $0 "Запуск команды \"$object $action $options\""
+  eval $cmd $options
+}
+
+# ********************************************************************
+# system_install - Процедура исполнения команды system install
+# --------------
+
+system_install()
+{
+  typeset sql
+
+  echo "Внимание! В процессе установки системы будет удалена информация"
+  echo "об узлах и уже приготовленных пакетах, если таковые имелись."
+
+  read answer?"Продолжить? (y/n)"
+  if [ "$answer" != "y" ]; then return 999; fi
+
+  # Сначала целиком очистить базу данных
+
+  system_uninstall
+  if [ $? -ne 0 ]; then return 999; fi
+
+  # Выполнить SQL-скрипт установки системы в БД
+ 
+  sql="$(replace "$SQL_SYSTEM_INSTALL" "<data_ver_major>" $METADATA_VER_MAJOR)"
+  sql="$(replace "$sql" "<data_ver_minor>" $METADATA_VER_MINOR)"
+  sql="$(replace "$sql" "<this>" $LOCAL_NODE)"
+  exec_sql SQL_SYSTEM_INSTALL "$sql"
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  return 0
+}
+
+# ********************************************************************
+# system_uninstall - Процедура исполнения команды system uninstall
+# ----------------
+
+system_uninstall()
+{
+  typeset item list owner table sql
+
+  # Удалить из системы все временные таблицы
+
+  list="$(sql_valuelist SQL_TEMPTABLELIST)"
+  if [ "$list" = "$SQL_ERROR" ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  for item in $list
+  do
+    owner=$(table_owner $item)
+    table=$(table_name $item)
+    sql="$(replace "$SQL_REMOVE_TABLE" "<owner>" $owner)"
+    sql="$(replace "$sql" "<table>" $table)"
+    exec_sql SQL_REMOVE_TEMPTABLE "$sql"
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Все временные таблицы из системы удалены"
+
+  # Выключить из процесса синхронизации все синхронизируемые таблицы
+
+  for item in $(tablelist)
+  do
+    remove_table $(table_owner $item) $(table_name $item)
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Данные о всех синхронизируемых таблицах из системы удалены"
+
+  # Удалить из системы все удаленные узлы
+
+  for item in $(nodelist)
+  do
+    remove_node $item
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Данные о всех удаленных узлах из системы удалены"
+
+  exec_sql SQL_SYSTEM_UNINSTALL
+  return $?
+}
+
+# ********************************************************************
+# system_update - Процедура исполнения команды system update
+# -------------
+
+system_update()
+{
+  typeset sql
+  typeset -i status
+
+  let status=0
+
+  # Выполнить SQL-скрипт обновления метаданных системы в БД
+
+  exec_sql SQL_SYSTEM_UPGRADE
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных при выполнении SQL-скрипта обновления метаданных"
+    return 999
+  fi 
+
+  # Выполнить SQL-скрипт обновления системы в БД
+ 
+  sql="$(replace "$SQL_SYSTEM_UPDATE" "<data_ver_major>" $METADATA_VER_MAJOR)"
+  sql="$(replace "$sql" "<data_ver_minor>" $METADATA_VER_MINOR)"
+  sql="$(replace "$sql" "<this>" $LOCAL_NODE)"
+  exec_sql SQL_SYSTEM_UPDATE "$sql"
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных при выполнении SQL-скрипта обновления системы"
+    return 999
+  fi 
+
+  # Обновить все синхронизируемые таблицы
+
+  for item in $(tablelist)
+  do
+    update_table $(table_owner $item) $(table_name $item) update
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+
+  # Удалить все кэш-файлы на подготовку пакетов
+
+  for item in `ls -1 -D $PATH_NODES | grep -v "^\.\.*"`
+  do
+    rm -f $PATH_NODES/$item/$CACHE_PREPARE_BASE.* 2> /dev/null
+    rm -f $PATH_NODES/$item/.prepare.sql 2> /dev/null
+    rm -f $PATH_NODES/$item/.update.sql 2> /dev/null
+  done
+
+  # Создать дерево каталогов для узлов, если это необходимо
+
+  for item in $(nodelist)
+  do
+    make_node_folder $item
+    let status=$?
+  done
+
+  return $status
+}
+
+# ********************************************************************
+# system_status - Процедура исполнения команды system status
+# -------------
+
+system_status()
+{
+  typeset item
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS)
+  if [ "$item" = "$SQL_ERROR" ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  if [ -z "$item" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Система не установлена в базе данных"
+    return 999
+  fi
+ 
+  echo
+  echo "Версия системы: $SYSTEM_VER"
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS_VERSION)
+  if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+
+  echo "Версия метаданных системы в БД: $item"
+  echo "Версия генерируемых системой пакетов: $PACKET_VER_MAJOR.$PACKET_VER_MINOR"
+  echo
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS_COVER)
+  if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+
+  echo Текущий'  'пакет: $item
+
+  echo Удаленные узлы:
+  items="$(sql_valuelist SQL_SYSTEM_STATUS_NODES)"
+  if [ "$items" = "$SQL_ERROR" ]; then return 1; fi 
+  for item in $items
+  do
+    echo "\t$item"
+  done
+
+  echo Синхронизируемые таблицы:
+  items="$(tablelist)"
+  if [ "$items" = "$SQL_ERROR" ]; then return 1; fi 
+  for item in $items
+  do
+    if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+    echo "\t$item"
+  done
+
+  echo
+}
+
+# ********************************************************************
+# system_reset-cache - Процедура исполнения команды system reset-cache
+# ------------------
+
+system_reset-cache()
+{
+  find $PATH_NODES -type f -name 'cache.*' -remove!
+  return 0
+}
+
+# ********************************************************************
+# keyring_make - Процедура исполнения команды keyring make
+# ------------
+# Параметры:
+#   "for" - служебное слово
+#   node  - имя узла
+
+keyring_make()
+{
+  typeset node
+  typeset key_name key_path
+
+  node=$2
+
+  # Предупредить пользователя
+
+  echo "ВНИМАНИЕ! При создании пары первичных ключей будет удалена текущая пара ключей"
+
+  read answer?"Продолжить? (y/n)"
+  if [ "$answer" != "y" ]; then return 999; fi
+
+  # Определить
+
+  if [ -z "$node" ]
+  then
+    key_name=$LOCAL_NODE
+    key_path=$SECURITY_HOMEDIR
+  else
+    key_name=$node
+    key_path=$SECURITY_HOMEDIR/$node
+  fi
+
+  # Очистить каталог ключей
+
+  if [ -d $key_path ]
+  then
+    rm -f $key_path/*.gpg
+    rm -f $key_path/*.gpg~
+    rm -f $key_path/random_seed
+  else
+    mkdir -p $key_path
+  fi
+
+  # Сгенерировать пару ключей
+
+  security_genkey $key_name $key_path
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Генерация пары ключей для узла \"$key_name\" прошла успешно"
+    return 0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка генерации пары ключей для узла \"$key_name\""
+    return 999
+  fi
+}
+
+# ********************************************************************
+# keyring_export - Процедура исполнения команды keyring export
+# --------------
+# Параметры:
+
+keyring_export()
+{
+  typeset key_name key_path key_file
+
+  key_name=$LOCAL_NODE
+  key_path=$SECURITY_HOMEDIR
+  key_file=$key_name.$EXT_PUBKEY
+
+  security_exportkey $key_name $key_path $key_file
+
+  return $?
+}
+
+# ********************************************************************
+# keyring_add - Процедура исполнения команды keyring add
+# -----------
+# Параметры:
+#   keyfile - файл - открытый ключ
+
+keyring_add()
+{
+  typeset keyfile keyname
+
+  keyfile=$1
+  keyname=${keyfile%.$EXT_PUBKEY}
+
+  # Проверить, задан ли файл ключа и существует ли он
+
+  if [ -z "$keyfile" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Не указан файл открытого ключа"
+    return 999
+  fi
+
+  if [ ! -f $keyfile ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Указанный файл открытого ключа ($keyfile) не найден"
+    return 999
+  fi
+
+  # Добавить открытый ключ в кольцо доверия
+
+  security_addkey $keyname $SECURITY_HOMEDIR $keyfile
+  return $?
+}
+
+# ********************************************************************
+# keyring_remove - Процедура исполнения команды keyring remove
+# --------------
+# Параметры:
+#   keyname - имя открытого ключа
+
+keyring_remove()
+{
+  typeset keyname
+
+  keyname=$1
+
+  security_removekey $keyname $SECURITY_HOMEDIR
+  return $?
+}
+
+# ********************************************************************
+# keyring_list - Процедура исполнения команды keyring list
+# ------------
+# Параметры:
+
+keyring_list()
+{
+  security_listkeys $SECURITY_HOMEDIR
+  return $?
+}
+
+# ********************************************************************
+# security_genkey - Сгенерировать пару ключей
+# ---------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором будет создана пара
+
+security_genkey()
+{
+  typeset name path
+  typeset tmpfile
+
+  name=$1
+  path=$2
+
+  # Сформировать файл параметров ключей
+
+  tmpfile=$PATH_TEMP/gpg.key_param
+  echo \
+"
+    Key-Type: DSA
+    Key-Length: 1024
+    Subkey-Type: ELG-E
+    Subkey-Length: 1024
+    Name-Real: $name
+    Expire-Date: 0
+    %commit
+" > $tmpfile
+
+  # Сгенерировать пару ключей
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --gen-key $tmpfile \
+      2> $PATH_TEMP/gpg-out.genkey
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Генерация пары ключей в каталог \"$path\" прошла успешно"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка генерации пары ключей в каталог \"$path\". См \"$PATH_TEMP/gpg-out.genkey\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_exportkey - Экспортировать открытый ключ
+# ------------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находиться пара ключей
+#   file   - файл, в который будет записан открытый ключ
+
+security_exportkey()
+{
+  typeset name path file
+
+  name=$1
+  path=$2
+  file=$3
+
+  gpg --batch --quiet --no-permission-warning \
+      --armor --homedir $path --export $name > $file \
+      2> $PATH_TEMP/gpg-out.export
+
+  return $?
+}
+
+# ********************************************************************
+# security_addkey - Добавить открытый ключ в кольцо доверия
+# ---------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находиться ключи системы
+#   file   - файл, в котором находится открытый ключ
+
+security_addkey()
+{
+  typeset name path file
+  typeset -i status
+
+  name=$1
+  path=$2
+  file=$3
+
+  # Добавить ключ в свое кольцо открытых ключей
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --import $file 2> $PATH_TEMP/gpg-out.addkey
+
+  let status=$?
+
+  # Подписать ключ своим ключом
+
+  if [ $status -eq 0 ]
+  then
+    gpg --batch --no-permission-warning \
+        --homedir $path --yes --lsign-key $name \
+        2>> $PATH_TEMP/gpg-out.addkey
+
+    let status=$?
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# security_removekey - Удалить открытый ключ в кольца доверия
+# ------------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находяться ключи
+
+security_removekey()
+{
+  typeset path
+
+  name=$1
+  path=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --yes --delete-key $name
+
+  return $?
+}
+
+# ********************************************************************
+# security_listkeys - Вывести список открытых ключей
+# -----------------
+# Параметры:
+#   path   - каталог, в котором находяться ключи
+
+security_listkeys()
+{
+  typeset path
+
+  path=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --armor --homedir $path --list-public-keys
+
+  return $?
+}
+
+# ********************************************************************
+# security_level - Получить из конф. файла уровень безопасности
+#                  пакетов для данного узла
+# --------------
+# Параметры:
+#   type   - тип уровня безопасности пакетов
+#   node   - удаленный узел
+
+security_level()
+{
+  typeset type node
+  typeset ret conffile config str
+  typeset -i colon
+
+  type=$1
+  node=$2
+
+  ret=$SEC_LEVEL0
+  conffile=$PATH_ETCS/$FILENAME_NODES_SEC
+
+  if [ -f $conffile ]
+  then
+
+    if [ "$type" = "$SEC_DIRECTION_OUT" ]
+    then
+      let colon=2
+    else
+      let colon=3
+    fi
+
+    config="`cat $conffile | awk '($0 != "") && (substr($1, 1, 1) != "#") { print $0 }'`"
+
+    str="`echo "$config" | awk '($1 == "default") { print $col }' col=$colon`"
+    if [ -n "$str" ]; then ret=$str; fi
+
+    str="`echo "$config" | awk '($1 == "'$node'") { print $col }' col=$colon`"
+    if [ -n "$str" ]; then ret=$str; fi
+
+  fi
+
+  if inlist "$ret" "$SEC_LEVEL0 $SEC_LEVEL1 $SEC_LEVEL2"
+  then
+    true
+  else
+    logmsg $ST_ERR 1 0 $0 "В файле \"$conffile\" указан недопустимый уровень безопасности \"$ret\" для узла \"$node\" или для \"default\""
+    ret=999
+  fi
+
+  logmsg $ST_INFO 3 0 $0 "Для узла \"$node\" уровень безопасности \"$ret\""
+  echo $ret
+}
+
+# ********************************************************************
+# security_sign - Подписать файл
+# -------------
+# Параметры:
+#   file   - имя файла
+
+security_sign()
+{
+  typeset file
+
+  file=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --output $file.$EXT_SIGNATURE \
+      --detach-sign $file
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" подписан"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка подписи файла \"$file\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_encrypt - Зашифровать файл
+# ----------------
+# Параметры:
+#   node   - удаленный узел-получатель
+#   file   - имя файла
+
+security_encrypt()
+{
+  typeset node file
+
+  node=$1
+  file=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --recipient $node \
+      --output $file.$EXT_ENCRYPT \
+      --encrypt $file
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" зашифрован для получателя \"$node\""
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка шифрования файла \"$file\" для получателя \"$node\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_verify - Проверить подпись.
+#                   Подписанный файл должен находится в том же каталоге,
+#                   что файл-подпись, но без расширения .sig
+# ---------------
+# Параметры:
+#   file   - имя файла-подписи
+
+security_verify()
+{
+  typeset file
+
+  file=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --trust-model always \
+      --verify $file 2>> $PATH_TEMP/gpg-out.verify
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Подпись файла \"$file\" достоверна"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка проверки подписи файла \"$file\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_decrypt - Расшифровать файл
+# ----------------
+# Параметры:
+#   inpfile   - имя зашифрованного файла
+#   outfile   - имя расшифрованного файла
+
+security_decrypt()
+{
+  typeset inpfile outfile
+
+  inpfile=$1
+  outfile=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --skip-verify \
+      --output $outfile \
+      --decrypt $inpfile
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" расшифрован"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка расшифровки файла \"$inpfile\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# node_add - Процедура исполнения команды node add
+# --------
+# Параметры:
+#   node - имя удаленного узла
+
+node_add()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, не существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Удаленный узел с таким именем уже существует"
+    return 999
+  fi
+
+  # Добавить удаленный узел в систему
+
+  add_node $node
+  return $?
+}
+
+# ********************************************************************
+# add_node - Добавить удаленный узел в систему
+# --------
+# Параметры:
+#   node - имя удаленного узла
+
+
+add_node()
+{
+  typeset node path_node sql
+  typeset -i status
+
+  node=$1
+
+  # Создать дерево каталогов для узла, если это необходимо
+
+  make_node_folder $node
+
+  # Добавить узел в базу данных
+
+  sql="$(replace "$SQL_NODE_ADD" "<node>" $node)"
+  exec_sql SQL_NODE_ADD "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Узел \"$node\" успешно добавлен в систему"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при добавлении узла \"$node\" в систему"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# make_node_folder - Создать каталог для удаленного узла
+# ----------------
+# Параметры:
+#   node - имя удаленного узла
+
+
+make_node_folder()
+{
+  typeset node path_node sql
+
+  node=$1
+
+  # Создать дерево каталогов для узла, если это необходимо
+
+  path_node=$PATH_NODES/$node
+  if [ ! -d $PATH_NODES ]; then mkdir $PATH_NODES; fi
+  if [ ! -d $path_node ]; then mkdir $path_node; fi
+  if [ ! -d $path_node/$FOLDER_INBOX ]; then mkdir $path_node/$FOLDER_INBOX; fi
+  if [ ! -d $path_node/$FOLDER_OUTBOX ]; then mkdir $path_node/$FOLDER_OUTBOX; fi
+
+  # Установить права на файлы и каталоги
+
+  chown -R $REMOTE_USER $path_node
+  chmod -R 770 $path_node
+}
+
+# ********************************************************************
+# node_remove - Процедура исполнения команды node remove
+# -----------
+# Параметры:
+#   node - имя удаленного узла
+
+node_remove()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    remove_node $node
+    let status=$?
+  else
+    logmsg $ST_ERR 1 1 $0 "Не существует удаленного узла с таким именем"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# remove_node - Удалить удаленный узел из системы
+# -----------
+# Параметры:
+#   node - имя удаленного узла
+#
+# Удаляется только информация об узле из базы данных.
+# Файлы и каталоги соответствующего узла остаются.
+
+remove_node()
+{
+  typeset node sql
+  typeset -i status
+
+  node=$1
+
+  sql="$(replace "$SQL_NODE_REMOVE" "<node>" $node)"
+  exec_sql SQL_NODE_REMOVE "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Данные об узле \"$node\" успешно удалены из системы"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при удалении из системы данных об узле \"$node\""
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# node_reset - Процедура исполнения команды node reset
+# ----------
+# Параметры:
+#   node - имя удаленного узла
+
+node_reset()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    reset_node $node
+    let status=$?
+  else
+    logmsg $ST_ERR 1 1 $0 "Не существует удаленного узла с таким именем"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# reset_node - Очистить очередь исходящих пакетов и начать заново
+#              формировать пакеты для узла
+# ----------
+# Параметры:
+#   node - имя удаленного узла
+
+reset_node()
+{
+  typeset node sql
+
+  

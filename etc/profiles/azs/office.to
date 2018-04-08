@@ -1,0 +1,22 @@
+#!/bin/sh
+
+. /qnx4/station/etc/global_station.conf
+
+# Подготовить пакет для передачи в офис
+
+on -p 6 /home/sync/syncctl data prepare for office
+
+# Для Кемерова
+
+if [ "$OFFICE" = "genkemerovo" ]
+then
+  datemask=`date +"%Y%m%d%H%M"`
+  cat /home/sync/sync.log | gzip > /home/sync/nodes/genkemerovo/outbox/sync.log.$datemask.gz;
+  rm -f /home/sync/sync.log;
+
+  if [ -f /home/sync/tmp/err* ]; then
+	cd /home/sync/tmp;
+	tar -c ./err* | gzip > /home/sync/nodes/genkemerovo/outbox/errors_$datemask.tar.gz;
+	rm -f ./err*;
+  fi
+fi

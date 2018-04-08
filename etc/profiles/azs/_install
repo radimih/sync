@@ -1,0 +1,53 @@
+#!/bin/sh
+
+. /qnx4/station/etc/global_station.conf
+
+syncctl system install
+syncctl node add $OFFICE
+
+# Основные таблицы
+
+syncctl table add mcc.ShiftsLog
+syncctl table add mcc.TransactionsLog
+
+# Продажа и пополнение карт на АЗС
+
+syncctl table add mcc.tTrAZSSaleCardGT
+syncctl table add mcc.Supplement
+
+# Все действия с мобильными картами
+
+syncctl table add mcc.CardLog
+syncctl table add mcc.Restitutions
+
+# Удаленные операции
+
+syncctl table add mcc.ZMSG_Reply
+
+# Магазин
+
+syncctl table add mcc.ShopExport
+
+# Сменные отчеты
+
+syncctl table add mcc.shiftrep1
+syncctl table add mcc.shiftrep2
+syncctl table add mcc.shiftrepcash
+syncctl table add mcc.shiftrepdiscount
+syncctl table add mcc.shiftrepdoc
+syncctl table add mcc.shiftrepbanks
+syncctl table add mcc.shiftrepttn
+syncctl table add mcc.BUH_Sales
+syncctl table add mcc.BUH_Movements
+syncctl table add mcc.ShiftsSumLog
+
+# Для контроля прохождения пакетов
+
+syncctl table add mcc.syncSTREAM
+
+# Для Урала
+
+if [ "$REGION" = "66" ]
+then
+  syncctl table add mcc.EB_Sales
+fi
