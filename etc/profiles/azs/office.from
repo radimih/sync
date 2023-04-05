@@ -1,0 +1,19 @@
+#!/bin/sh
+
+. /qnx4/station/etc/global_station.conf
+
+# Объединить входящие пакет
+
+gzip -d /home/sync/nodes/$OFFICE/inbox/pkt-???????.tgz??.gz
+find /home/sync/nodes/$OFFICE/inbox -type f -name 'pkt-???????.tgzaa' -exec 'rm -f {2,}; cat {2,}?? >> {2,}; gzip -cd {2,} > /dev/null && rm -f {2,}??'
+
+# Обработать входящие пакеты
+
+on -p 6 /home/sync/syncctl data update from office
+
+# Пост-обработка данных
+
+if [ "$REGION" = "66" ]
+then
+  /home/root/xservice/eburg/update_clients fast
+fi

@@ -1,0 +1,191 @@
+#!/bin/sh
+#
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Скрипт работы со списком АЗС
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+######################################################################
+#
+#ifdef __USAGE
+#%С - Скрипт работы со списком АЗС
+#
+#%C <команда> [<парметры>]
+#
+#Команды:
+#
+#  add <номер АЗС> <номер телефона> - добавление новой АЗС:
+#                                       - создание узла azs<номер АЗС>
+#                                       - добавление узла в azs.list
+#                                       - обновление списка узлов qtalk
+#
+#  list  - вывести список АЗС в виде списка узлов системы синхронизации
+#  qtalk - создать список узлов qtalk из списка АЗС
+#
+#Примечание:
+#  Скрипт использует файл настройки sync.conf
+#
+#endif
+#
+
+if [ $# -lt 1 ]
+then
+  /bin/use $0
+  exit 1
+fi
+
+# ********************************************************************
+# Global settings
+
+. `dirname $0`/etc/common
+
+# ********************************************************************
+# Local settings
+
+FILE_AZSLIST=`dirname $0`/etc/azs.list
+AZSNAME_PREFIX=azs
+
+QTALK_FILE=/etc/config/qtalk
+QTALK_DIALPREFIX=ATDT
+QTALK_MODEM=/dev/ser1
+
+FIELD_SEPARATOR=---
+
+commands="add list qtalk"
+
+# ********************************************************************
+# main - Главная процедура, с которой начинается выполнение скрипта
+# ----
+# Проверяет правильность задания аргументов скрипта и вызывает
+# соответствующую им процедуру.
+#
+# Параметры:
+#   command - команда
+#   options - дополнительные опции
+
+main()
+{
+  typeset command options
+
+  command=$1
+  shift 1
+  options=$*
+
+  # Проверить правильность задания команды в командной строке
+
+  if inlist "$command" "$commands"
+  then
+    :
+  else
+    echo "Неизвестная команда \"$command\""
+    return 1
+  fi
+
+  # Вызвать процедуру обработки заданной команды
+
+  cmd="cmd_${command}"
+  eval $cmd $options
+}
+
+# ********************************************************************
+# cmd_add - Процедура исполнения команды add
+# -------
+# Параметры:
+#  azs_no    - номер АЗС
+#  azs_phone - номер телефона АЗС
+
+cmd_add()
+{
+  typeset -i azs_no
+  typeset azs_phone
+  typeset azs_name
+
+  if [ $# -ne 2 ]
+  then
+    echo Неверно заданы аргументы
+    return 1
+  fi
+
+  let azs_no=$1
+  azs_phone=$2
+  azs_name=${AZSNAME_PREFIX}${azs_no}
+
+  syncctl node add $azs_name
+  if [ $? -ne 0 ]; then return 1; fi
+
+  echo "${azs_name}\t${azs_phone}" >> $FILE_AZSLIST
+  cmd_qtalk
+
+  return 0
+}
+
+# ********************************************************************
+# cmd_list - Процедура исполнения команды list
+# --------
+# Параметры:
+
+cmd_list()
+{
+  for line in $(conf_rows "$(conf_text $FILE_AZSLIST)")
+  do
+    echo $(conf_column "$line" 1)
+  done
+  return 0
+}
+
+# ********************************************************************
+# cmd_qtalk - Процедура исполнения команды qtalk
+# ---------
+# Параметры:
+
+cmd_qtalk()
+{
+  rm -f $QTALK_FILE
+
+  for line in $(conf_rows "$(conf_text $FILE_AZSLIST)")
+  do
+    azs_name="$(conf_column "$line" 1)"
+    azs_phone="${QTALK_DIALPREFIX}$(conf_column "$line" 2)"
+    echo "${azs_name}\t${azs_phone}" >> $QTALK_FILE
+  done
+
+  echo >> $QTALK_FILE
+  echo "defaults" >> $QTALK_FILE
+  echo "  -m $QTALK_MODEM" >> $QTALK_FILE
+
+  return 0
+}
+
+# ********************************************************************
+
+conf_text()
+{
+  typeset file=$1
+
+  cat $file | awk '($0 != "") && (substr($1, 1, 1) != "#") { print $0 }'
+}
+
+# ********************************************************************
+
+conf_rows()
+{
+  typeset text="$1"
+  typeset awk_program
+
+  awk_program='{ for (i = 1; i <= NF; i++) printf "%s'$FIELD_SEPARATOR'", $i; printf "\n" }'
+
+  echo "$text" | awk "$awk_program"
+}
+
+# ********************************************************************
+
+conf_column()
+{
+  typeset row="$1"
+  typeset -i ncol=$2
+
+  echo "$row" | awk -v FS=$FIELD_SEPARATOR '{print $'$ncol'}'
+}
+
+main $*

@@ -1,0 +1,218 @@
+#!/bin/sh
+#
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Подсистема архивирования пакетов  
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+######################################################################
+#
+#ifdef __USAGE
+#%C - Архивировать входящий или исходящий пакет 
+#
+#%C <in|out>-packet <номер> by <узел>
+#
+#Опции:
+#
+#  in    - входящий пакет (полученный из удаленного узла)
+#  out   - исходящий пакет (переданный на удаленный узел)
+#  номер - номер пакета
+#  узел  - название удаленного узла
+#
+#Примечание:
+#  Скрипт использует файл настройки sync.conf
+#
+#endif
+#
+
+if [ $# -ne 4 ]
+then
+	/bin/use $0
+	exit 1
+fi
+
+# ********************************************************************
+# Global settings
+
+. `dirname $0`/etc/common
+. `dirname $0`/etc/sync.conf
+
+# ********************************************************************
+# Local settings
+
+SCRIPT_NAME=`basename $0`	# Имя скрипта. Используется для
+				# отображения имени скрипта в
+				# сообщениях лога 
+
+packet_type_in=in-packet
+packet_type_out=out-packet
+
+arg1="$packet_type_in $packet_type_out"
+arg2="^[01234567890]+$"
+arg3=by
+
+# ********************************************************************
+# main - Главная процедура, с которой начинается выполнение скрипта
+# ----
+# Проверяет правильность задания аргументов скрипта и вызывает
+# процедуру архивирования.
+# 
+# Параметры:
+#   type     - тип пакета
+#   number   - номер пакета
+#   "by"     - служебное слово
+#   node     - имя узла
+
+main()
+{
+  typeset type node
+  typeset -i number
+
+  # Проверить правильность задания аргументов в командной строке
+
+  # --- аргумент 1
+
+  if inlist "$1" "$arg1"
+  then
+    :
+  else
+    logmsg $ST_ERR 1 1 $0 "Неправильно указан тип пакета"
+    return 1
+  fi
+
+  # --- аргумент 2
+
+  if [ "`echo $2 | egrep "$arg2"`" = "" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильный номер пакета"
+    return 1
+  fi
+
+  # --- аргумент 3
+
+  if [ "$3" != "$arg3" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильный синтаксис командной строки"
+    return 1
+  fi
+
+  # --- аргумент 4
+
+  if inlist $4 "`$PATH_BASE/syncctl node list`"
+  then
+    :
+  else
+    logmsg $ST_ERR 1 1 $0 "Не существует удаленного узла с таким именем"
+    return 1
+  fi
+
+  type=$1
+  let number=$2
+  node=$4
+
+  # Вызвать процедуру обработки заданной команды
+
+  arch $type $number $node
+}
+
+# ********************************************************************
+# arch - Архивировать пакет
+# ----
+# Параметры:
+#   type     - тип пакета
+#   number   - номер пакета
+#   node     - имя узла
+
+arch()
+{
+  typeset type node folder
+  typeset packet_path packet_name packet_file
+  typeset archive_path archive_name archive_file
+  typeset pathpart_type pathpart_node pathpart_month
+  typeset -i number
+
+  type=$1
+  let number=$2
+  node=$3
+
+  if [ "$type" = "$packet_type_in" ]
+  then
+    folder=$FOLDER_INBOX
+  else
+    folder=$FOLDER_OUTBOX
+  fi
+
+  # Определить имя пакета
+
+  packet_path=$PATH_NODES/$node/$folder
+  packet_name=$(pkt_filename_by_number $number)
+
+  # Проверить, существует ли пакет
+
+  if [ -f $packet_path/$packet_name.tgz ]
+  then
+    packet_name=$packet_name.tgz
+
+  elif [ -f $packet_path/$packet_name.tar.gz ]
+  then
+    packet_name=$packet_name.tar.gz
+  else
+    logmsg $ST_ERR 1 1 $0 "Пакета $packet_name не существует"
+    return 1
+  fi
+  packet_file=$packet_path/$packet_name
+
+  # Ничего не делать, если указано, что не архивировать
+  # пакеты данного типа
+
+  if [ '(' "$type" = "$packet_type_in" -a "$ARCHIVE_INBOX" != "Y" ')' -o \
+       '(' "$type" = "$packet_type_out" -a "$ARCHIVE_OUTBOX" != "Y" ')' \
+     ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Пакеты данного типа не архивируются"
+    return 0
+  fi
+
+  # Определить компоненты пути к архиву
+
+  pathpart_type=$folder
+  pathpart_node=$node
+  pathpart_month=`date "+%Y.%m"`
+
+  # Определить путь к архиву
+
+  archive_path=$(arch_path $pathpart_type $pathpart_node $pathpart_month)
+  archive_name=$packet_name
+  archive_file=$archive_path/$archive_name
+
+  # Создать подкаталог для архива, если он еще не существует
+
+  if [ ! -d $archive_path ]; then mkdir -p $archive_path; fi
+
+  # Скопировать пакет в архив
+
+  cp $packet_file $archive_file 2> /dev/null
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Пакет $packet_file скопирован в $archive_file"
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при копировании пакета $packet_file в $archive_file"
+    return 1
+  fi
+}
+
+# ********************************************************************
+
+logmsg $ST_INFO 1 0 "" "Начало выполнения команды \"`basename $0` $*\""
+
+main $*
+
+if [ $? -eq 0 ]
+then
+  logmsg $ST_INFO 1 0 "" "Команда \"`basename $0` $*\" успешно выполнена"
+  exit 0
+else
+  logmsg $ST_INFO 1 0 "" "Команда \"`basename $0` $*\" выполнилась с ошибкой"
+  exit 1
+fi

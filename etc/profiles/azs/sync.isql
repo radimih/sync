@@ -1,0 +1,13 @@
+#!/bin/sh
+
+dbuser=mcc
+dbpassword=station
+engname=station
+dbname=station
+
+if [ "$1" != "" ]; then
+	cmd=-q
+else
+	cmd=
+fi
+/usr/bin/isql -c "userid=$dbuser;password=$dbpassword;enginename=$engname" $cmd $1

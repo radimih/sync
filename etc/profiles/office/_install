@@ -1,0 +1,77 @@
+#!/bin/sh
+
+. /etc/config/global_station.conf
+
+syncctl system install
+
+# Таблицы для отправки на АЗС
+
+# -- Карты
+
+syncctl table add mcc.Cards
+syncctl table add mcc.MPCOSKeys
+syncctl table add mcc.EmitentNumbers
+syncctl table dwatch-off mcc.Cards
+
+# -- Продажа и пополнение карт на АЗС
+
+syncctl table add mcc.tTrAZSDiscountGT
+syncctl table add mcc.tTrAZSDiscountMapGT
+syncctl table add mcc.tTrAZSDiscountMapGSMGT
+syncctl table add mcc.tTrAZSDiscountPercentGT
+syncctl table add mcc.tTrAZSPriceGT
+syncctl table add mcc.tTrCardForSaleGT
+
+# -- Удаленное обновление карт на АЗС
+
+syncctl table add mcc.ZMsg_Query
+syncctl table add mcc.RJob
+syncctl table add mcc.RJob_UpdateLimits
+syncctl table add mcc.RJob_Supplement
+syncctl table add mcc.RJob_PathLimit
+syncctl table add mcc.RJob_PathLimit_Petrol
+syncctl table add mcc.RJob_Bonus
+syncctl table add mcc.RJob_Maintenance
+
+# -- Магазин
+
+syncctl table add mcc.stovar
+
+# -- Поддержка карт ЕНП/СНП (Урал)
+
+if [ "$REGION" = "66" ]
+then
+  syncctl table add mcc.EB_Accounts
+  syncctl table add mcc.EB_Discounts
+  syncctl table add mcc.EB_Cards
+  syncctl table add mcc.EB_Amounts
+  syncctl table add mcc.EB_Limits
+  syncctl table add mcc.EB_LastSales
+
+  syncctl table dwatch-off mcc.EB_Accounts
+  syncctl table dwatch-off mcc.EB_Discounts
+  syncctl table dwatch-off mcc.EB_Cards
+  syncctl table dwatch-off mcc.EB_Amounts
+  syncctl table dwatch-off mcc.EB_Limits
+  syncctl table dwatch-off mcc.EB_LastSales
+fi
+
+# Таблицы для отправки на региональный сервер
+
+# -- Для контроля прохождения пакетов синхронизации
+
+syncctl table add oc2.syncSTREAM
+
+# -- "Местные" справочники городов и АЗС
+
+syncctl table add oc2.tTownGT
+syncctl table add oc2.tAZSGT
+
+# -- Транзиты по своим картам
+
+syncctl table add oc2.tTranzitCardsGT
+
+# -- Заправки по "чужим" картам
+
+syncctl table add mcc.TransactionsLog
+syncctl table dwatch-off mcc.TransactionsLog

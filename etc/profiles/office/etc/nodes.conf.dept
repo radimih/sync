@@ -1,0 +1,136 @@
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Файл конфигурации узлов - для оперцентра-ФИЛИАЛА
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+######################################################################
+
+# === Groups ===
+
+group_azses="`$PATH_BASE/azsconf list`"
+
+group_v53=""
+group_v54=""
+
+# Группа: имя узла - регионального центра обмена информацией
+
+group_RegionCenter="center"
+
+# ==============
+
+# === For nodes: v54
+
+# -- Карты
+
+table_mcc_MPCOSKeys="Emitent KeyVersion KeyUsage KeyData"
+table_mcc_EmitentNumbers="EmitentNo FormatVer"
+table_mcc_Cards="CardId CardNo EmitentNo UserPwd Arrested Banned CSC0Low CSC1Low CSC2Low CSC0High CSC1High CSC2High CardFormat LLitr LCash"
+
+# -- Продажа и пополнение карт на АЗС
+
+table_mcc_tTrAZSDiscountGT="TrID AzsNo TypeDiscount NameDiscount FormatCard VidDiscount TypeEdIzm DateOpen ShiftOpen DateClose ShiftClose IDTypeD ConvertType PayOrder Discount"
+condi_mcc_tTrAZSDiscountGT="AzsNo = <receiver_number>"
+table_mcc_tTrAZSDiscountMapGT="TrID TypeDiscount TypeMap IDTypeD"
+table_mcc_tTrAZSDiscountMapGSMGT="TrID TypeDiscount TypeMap IDTypeD PetrolCode"
+table_mcc_tTrAZSDiscountPercentGT="TrID TypeMap DiscBound Percent"
+table_mcc_tTrAZSPriceGT="TrID AzsNo TypePrice DateOpen ShiftOpen PetrolCode PetrolPrice MinQuantity"
+condi_mcc_tTrAZSPriceGT="AzsNo = <receiver_number>"
+table_mcc_tTrCardForSaleGT="PrID AzsNo CardNo Emitent FormatCard DateDef FlgSend"
+condi_mcc_tTrCardForSaleGT="AzsNo = <receiver_number>"
+
+# -- Удаленное обновление карт на АЗС
+
+table_mcc_ZMsg_Query="SyncId MsgId SrcDept DstDept AZSNo QueryType EnqueueDate"
+condi_mcc_ZMsg_Query="AZSNo=<receiver_number>"
+
+table_mcc_RJob="SyncId MsgId SrcDept Emitent CardNo Channel GroupNo JobNo JobType IntroDate State"
+condi_mcc_RJob="AZSNo=<receiver_number>"
+
+table_mcc_RJob_Bonus="SyncId Emitent CardNo Channel JobNo Petrol Bonus"
+condi_mcc_RJob_Bonus="AZSNo=<receiver_number>"
+
+table_mcc_RJob_Maintenance="SyncId MsgId Emitent CardNo Channel JobNo SrcDept DstDept"
+condi_mcc_RJob_Maintenance="AZSNo=<receiver_number>"
+
+table_mcc_RJob_PathLimit="SyncId Emitent CardNo Channel JobNo StartDate EndDate"
+condi_mcc_RJob_PathLimit="AZSNo=<receiver_number>"
+
+table_mcc_RJob_PathLimit_Petrol="SyncId Emitent CardNo Channel JobNo Petrol Limit"
+condi_mcc_RJob_PathLimit_Petrol="AZSno=<receiver_number>"
+
+table_mcc_RJob_Supplement="SyncId Emitent CardNo Channel JobNo Petrol Amount"
+condi_mcc_RJob_Supplement="AZSNo=<receiver_number>"
+
+table_mcc_RJob_UpdateLimits="SyncId Emitent CardNo Channel JobNo Petrol DayLimit DayRest MonthLimit Monthrest"
+condi_mcc_RJob_UpdateLimits="AZSNo=<receiver_number>"
+
+# -- Магазин
+
+table_mcc_stovar="id idgroup code name cena edizm beginprice"
+
+# -- Поддержка карт ЕНП/СНП (Урал)
+
+#table_mcc_EB_Accounts="*"
+#table_mcc_EB_Discounts="*"
+#table_mcc_EB_Cards="*"
+#table_mcc_EB_Amounts="*"
+#table_mcc_EB_Limits="*"
+#table_mcc_EB_LastSales="*"
+
+# ==============
+
+# === For nodes: v53
+
+# -- Карты
+
+table_mcc_MPCOSKeys="Emitent KeyVersion KeyUsage KeyData"
+table_mcc_EmitentNumbers="EmitentNo FormatVer"
+table_mcc_Cards="CardId CardNo EmitentNo UserPwd Arrested Banned CSC0Low CSC1Low CSC2Low CSC0High CSC1High CSC2High CardFormat LLitr LCash"
+
+# -- Продажа и пополнение карт на АЗС
+
+table_mcc_tTrAZSDiscountGT="TrID AzsNo TypeDiscount NameDiscount FormatCard VidDiscount TypeEdIzm DateOpen ShiftOpen DateClose ShiftClose IDTypeD ConvertType PayOrder Discount"
+condi_mcc_tTrAZSDiscountGT="AzsNo = <receiver_number>"
+table_mcc_tTrAZSDiscountMapGT="TrID TypeDiscount TypeMap IDTypeD"
+table_mcc_tTrAZSDiscountMapGSMGT="TrID TypeDiscount TypeMap IDTypeD PetrolCode"
+table_mcc_tTrAZSDiscountPercentGT="TrID TypeMap DiscBound Percent"
+table_mcc_tTrAZSPriceGT="TrID AzsNo TypePrice DateOpen ShiftOpen PetrolCode PetrolPrice MinQuantity"
+condi_mcc_tTrAZSPriceGT="AzsNo = <receiver_number>"
+table_mcc_tTrCardForSaleGT="PrID AzsNo CardNo Emitent FormatCard DateDef FlgSend"
+condi_mcc_tTrCardForSaleGT="AzsNo = <receiver_number>"
+
+# -- Магазин
+
+table_mcc_stovar="id idgroup code name cena edizm beginprice"
+
+# -- Поддержка карт ЕНП/СНП (Урал)
+
+#table_mcc_EB_Accounts="*"
+#table_mcc_EB_Discounts="*"
+#table_mcc_EB_Cards="*"
+#table_mcc_EB_Amounts="*"
+#table_mcc_EB_Limits="*"
+#table_mcc_EB_LastSales="*"
+
+# ==============
+
+# === For nodes: RegionCenter
+
+table_oc2_tTownGT="Emitent Dept TownCode TownName"
+condi_oc2_tTownGT="Dept = (select Department from oc2.tGeneralGT)"
+
+table_oc2_tAZSGT="Emitent Dept AZSCode TownCode AZSComment"
+condi_oc2_tAZSGT="Dept = (select Department from oc2.tGeneralGT)"
+
+table_oc2_tTranzitCardsGT="CardNo EmitentNo DeptNo Tranzit"
+
+table_mcc_CardsOuting="{CardNo} EmitentNo Dept UserPwd Arrested Banned CSC0Low CSC1Low CSC2Low CSC0High CSC1High CSC2High"
+alias_mcc_CardsOuting="mcc.Cards"
+
+table_mcc_TransactionsLog="TransactionId PaymentId TrkId GoodId Price RequestedVolume TransClosed TimePoint ShiftId AZSNo AZSEmit AZSDept CardEmit CardDept"
+condi_mcc_TransactionsLog="PaymentType = 2
+                      and CardDept != (select Department from oc2.tGeneralGT)
+                      and ShiftId >= 36530" # c 1.01.2006
+
+# ==============

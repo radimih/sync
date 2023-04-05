@@ -1,0 +1,3388 @@
+#!/bin/sh
+#
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Система синхронизации - управляющий скрипт
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+#
+# Примечание:
+#
+#   В целом, скрипт не зависит от СУБД. Все SQL-выражения и
+#   функция sql_valuelist описаны в файле $SQL_RDBMS.sql.
+#
+######################################################################
+#
+#ifdef __USAGE
+#%C - 
+#
+#%C <объект> <действие> [<опции>]
+#
+#Объекты:
+#
+#  system   - система синхронизации в целом
+#  keyring  - ключи системы
+#  node     - удаленный узел (узел, который будет получать данные)
+#  table    - синхронизируемая таблица
+#  data     - данные синхронизации
+#  prepared - номер последнего успешно сформированного пакета
+#  updated  - номер последнего успешно обработанного пакета
+#
+#Действия над объектом system:
+#
+#  install     - установить систему в базе данных
+#  uninstall   - убрать из базы все, что относится к системе
+#  update      - обновить систему в базе данных
+#  status      - вывести данные о системе (версия, узлы, таблицы) 
+#  reset-cache - сбросить все кэшированные SQL-скрипты
+#
+#Действия над объектом keyring:
+#
+#  make            - создать первичную пару ключей для данного узла
+#  make for <узел> - создать первичную пару ключей для узла <узел>
+#  add <узел>.key  - добавить открытый ключ узла в кольцо доверия
+#  remove <узел>   - удалить открытый ключ узла из кольца доверия
+#  list            - вывести список открытых ключей
+#  export          - выгрузить свой открытый ключ в файл <узел>.key  
+#
+#Действия над объектом node:
+#
+#  add <название узла>      - добавить узел в систему
+#  remove <название узла>   - убрать узел из системы
+#  reset <название узла>    - начать заново формирование исходящих пакетов
+#  list                     - вывести список узлов, зарегистрированных
+#                             в системе
+#
+#Действия над объектом table:
+#
+#  add <имя таблицы>        - сделать записи таблицы тиражируемые на узлы 
+#  update <имя таблицы>     - обновить метаданные таблицы для тиражирования 
+#  remove <имя таблицы>     - прикратить тиражировать записи таблицы
+#  dwatch-on <имя таблицы>  - включить слежение за удалением записей таблицы
+#  dwatch-off <имя таблицы> - выключить слежение за удалением записей таблицы
+#
+#Действия над объектом data:
+#
+#  prepare [for <group>]    - подготовить данные для отправки на узел/узлы
+#  update from <group>      - обновить БД данными, пришедшими с узла/узлов
+#
+#  где <group> - название группы узлов или конкретного узла
+#
+#Действия над объектом prepared:
+#
+# get for <node>       - вернуть номер последнего успешно сформированного пакета
+# set <num> for <node> - установить номер последнего успешно сформированного
+#                        пакета
+#
+#Действия над объектом updated:
+#
+# get for <node>       - вернуть номер последнего успешно обработанного пакета
+# set <num> for <node> - установить номер последнего успешно обработанного
+#                        пакета
+#
+#Примечание:
+#  Скрипт использует файл настройки sync.conf
+#
+#endif
+#
+
+if [ $# -lt 2 ]
+then
+	/bin/use $0
+	exit 1
+fi
+
+set -q
+
+# ********************************************************************
+# Global settings
+
+. `dirname $0`/etc/common
+. `dirname $0`/etc/sync.conf
+
+# ********************************************************************
+# SQL settings
+
+. `dirname $0`/etc/$SQL_RDBMS.sql
+
+# ********************************************************************
+# Local settings
+
+SCRIPT_NAME=`basename $0` # Имя скрипта. Используется для
+                          # отображения имени скрипта в
+                          # сообщениях лога 
+
+LOCAL_NODE=$NODENAME      # название локального узла. Используется на
+                          # удаленном узле в качестве идентификатора
+                          # в БД и как название каталога данных,
+                          # относящихся к этому локальному узлу.
+
+process_full=$0
+process_name=`basename $0`
+process_number=$$
+
+# Списки объектов и действий над ними, допустимые для
+# указания в командной строке
+
+list_object="system keyring node table data prepared updated"
+list_system_action="install uninstall update status reset-cache"
+list_keyring_action="make add remove list export"
+list_node_action="add remove list reset"
+list_table_action="add update remove dwatch-on dwatch-off"
+list_data_action="prepare update"
+list_prepared_action="get set"
+list_updated_action="get set"
+
+SQL_ERROR="SQL_ERROR" # специальное значение, возвращаемое функцией
+                      # sql_valuelist, сигнализируещее о произошедшей
+                      # ошибке.
+
+ERROR_BUSY=2      # Код ошибки "Выполняется аналогичная команда"
+ERROR_STR="ERROR" # Код ошибки для функций, возвращающих строковое значение
+RETURN_SKIP=-1    # Код возврата "Игнорировать пакет"
+
+# ********************************************************************
+# main - Главная процедура, с которой начинается выполнение скрипта
+# ----
+# Проверяет правильность задания аргументов скрипта и вызывает
+# соответствующую им процедуру.
+# 
+# Параметры:
+#   object  - имя объекта 
+#   action  - действие над объектом 
+#   options - дополнительные опции
+
+main()
+{
+  typeset object action options action_list
+
+  object=$1
+  action=$2
+  shift 2
+  options=$*
+
+  # Проверить, задан ли параметр NODENAME в sync.conf
+
+  if [ -z "$NODENAME" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Не задано название данного узла (параметр NODENAME в sync.conf)"
+    return 999
+  fi
+
+  # Проверить правильность задания объекта в командной строке
+
+  if inlist "$object" "$list_object"
+  then
+    true # Такая странная конструкция обусловленна невозможностью
+         # в первом приближении инвертировать результат функции
+  else
+    logmsg $ST_ERR 1 1 $0 "Неизвестный тип объекта \"$object\""
+    return 999
+  fi
+
+  # Проверить правильность задания действия над объектом в командной строке
+
+  action_list="\$list_${object}_action"
+  action_list=`eval echo $action_list`
+
+  if inlist "$action" "$action_list"
+  then
+    true
+  else
+    logmsg $ST_ERR 1 1 $0 "Недопустимое действие \"$action\" над объектом \"$object\""
+    return 999
+  fi
+
+  # Проверить на недопустимость параллельного выполнения нескольких
+  # команд с объектом data.
+  # !!! Иногда происходит ложное срабатывание
+
+#  if [ "$object" = "data" ]
+#  then
+#    if [ -n "`ps -a | grep -v "READY" | grep -v grep | grep -v "^ *$process_number" | grep "$process_full data"`" ]
+#    then
+#      logmsg $ST_WARN 1 1 "" "В памяти исполняется другой экземпляр программы \"$process_name\". Досрочное завершение этого экземпляра"
+#      return $ERROR_BUSY
+#    fi
+#  fi
+
+  # Удалить все временные файлы системы
+
+  rm -f $PATH_TEMP/* 2> /dev/null
+
+  # Вызвать процедуру обработки заданной команды
+
+  cmd="${object}_${action}"
+  logmsg $ST_INFO 3 0 $0 "Запуск команды \"$object $action $options\""
+  eval $cmd $options
+}
+
+# ********************************************************************
+# system_install - Процедура исполнения команды system install
+# --------------
+
+system_install()
+{
+  typeset sql
+
+  echo "Внимание! В процессе установки системы будет удалена информация"
+  echo "об узлах и уже приготовленных пакетах, если таковые имелись."
+
+  read answer?"Продолжить? (y/n)"
+  if [ "$answer" != "y" ]; then return 999; fi
+
+  # Сначала целиком очистить базу данных
+
+  system_uninstall
+  if [ $? -ne 0 ]; then return 999; fi
+
+  # Выполнить SQL-скрипт установки системы в БД
+ 
+  sql="$(replace "$SQL_SYSTEM_INSTALL" "<data_ver_major>" $METADATA_VER_MAJOR)"
+  sql="$(replace "$sql" "<data_ver_minor>" $METADATA_VER_MINOR)"
+  sql="$(replace "$sql" "<this>" $LOCAL_NODE)"
+  exec_sql SQL_SYSTEM_INSTALL "$sql"
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  return 0
+}
+
+# ********************************************************************
+# system_uninstall - Процедура исполнения команды system uninstall
+# ----------------
+
+system_uninstall()
+{
+  typeset item list owner table sql
+
+  # Удалить из системы все временные таблицы
+
+  list="$(sql_valuelist SQL_TEMPTABLELIST)"
+  if [ "$list" = "$SQL_ERROR" ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  for item in $list
+  do
+    owner=$(table_owner $item)
+    table=$(table_name $item)
+    sql="$(replace "$SQL_REMOVE_TABLE" "<owner>" $owner)"
+    sql="$(replace "$sql" "<table>" $table)"
+    exec_sql SQL_REMOVE_TEMPTABLE "$sql"
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Все временные таблицы из системы удалены"
+
+  # Выключить из процесса синхронизации все синхронизируемые таблицы
+
+  for item in $(tablelist)
+  do
+    remove_table $(table_owner $item) $(table_name $item)
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Данные о всех синхронизируемых таблицах из системы удалены"
+
+  # Удалить из системы все удаленные узлы
+
+  for item in $(nodelist)
+  do
+    remove_node $item
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+  logmsg $ST_INFO 3 0 $0 "Данные о всех удаленных узлах из системы удалены"
+
+  exec_sql SQL_SYSTEM_UNINSTALL
+  return $?
+}
+
+# ********************************************************************
+# system_update - Процедура исполнения команды system update
+# -------------
+
+system_update()
+{
+  typeset sql
+  typeset -i status
+
+  let status=0
+
+  # Выполнить SQL-скрипт обновления метаданных системы в БД
+
+  exec_sql SQL_SYSTEM_UPGRADE
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных при выполнении SQL-скрипта обновления метаданных"
+    return 999
+  fi 
+
+  # Выполнить SQL-скрипт обновления системы в БД
+ 
+  sql="$(replace "$SQL_SYSTEM_UPDATE" "<data_ver_major>" $METADATA_VER_MAJOR)"
+  sql="$(replace "$sql" "<data_ver_minor>" $METADATA_VER_MINOR)"
+  sql="$(replace "$sql" "<this>" $LOCAL_NODE)"
+  exec_sql SQL_SYSTEM_UPDATE "$sql"
+  if [ $? -ne 0 ]
+  then
+    echo "Ошибка базы данных при выполнении SQL-скрипта обновления системы"
+    return 999
+  fi 
+
+  # Обновить все синхронизируемые таблицы
+
+  for item in $(tablelist)
+  do
+    update_table $(table_owner $item) $(table_name $item) update
+    if [ $? -ne 0 ]; then return 1; fi
+  done
+
+  # Удалить все кэш-файлы на подготовку пакетов
+
+  for item in `ls -1 -D $PATH_NODES | grep -v "^\.\.*"`
+  do
+    rm -f $PATH_NODES/$item/$CACHE_PREPARE_BASE.* 2> /dev/null
+    rm -f $PATH_NODES/$item/.prepare.sql 2> /dev/null
+    rm -f $PATH_NODES/$item/.update.sql 2> /dev/null
+  done
+
+  # Создать дерево каталогов для узлов, если это необходимо
+
+  for item in $(nodelist)
+  do
+    make_node_folder $item
+    let status=$?
+  done
+
+  return $status
+}
+
+# ********************************************************************
+# system_status - Процедура исполнения команды system status
+# -------------
+
+system_status()
+{
+  typeset item
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS)
+  if [ "$item" = "$SQL_ERROR" ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  if [ -z "$item" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Система не установлена в базе данных"
+    return 999
+  fi
+ 
+  echo
+  echo "Версия системы: $SYSTEM_VER"
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS_VERSION)
+  if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+
+  echo "Версия метаданных системы в БД: $item"
+  echo "Версия генерируемых системой пакетов: $PACKET_VER_MAJOR.$PACKET_VER_MINOR"
+  echo
+
+  item=$(sql_valuelist SQL_SYSTEM_STATUS_COVER)
+  if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+
+  echo Текущий'  'пакет: $item
+
+  echo Удаленные узлы:
+  items="$(sql_valuelist SQL_SYSTEM_STATUS_NODES)"
+  if [ "$items" = "$SQL_ERROR" ]; then return 1; fi 
+  for item in $items
+  do
+    echo "\t$item"
+  done
+
+  echo Синхронизируемые таблицы:
+  items="$(tablelist)"
+  if [ "$items" = "$SQL_ERROR" ]; then return 1; fi 
+  for item in $items
+  do
+    if [ "$item" = "$SQL_ERROR" ]; then return 1; fi 
+    echo "\t$item"
+  done
+
+  echo
+}
+
+# ********************************************************************
+# system_reset-cache - Процедура исполнения команды system reset-cache
+# ------------------
+
+system_reset-cache()
+{
+  find $PATH_NODES -type f -name 'cache.*' -remove!
+  return 0
+}
+
+# ********************************************************************
+# keyring_make - Процедура исполнения команды keyring make
+# ------------
+# Параметры:
+#   "for" - служебное слово
+#   node  - имя узла
+
+keyring_make()
+{
+  typeset node
+  typeset key_name key_path
+
+  node=$2
+
+  # Предупредить пользователя
+
+  echo "ВНИМАНИЕ! При создании пары первичных ключей будет удалена текущая пара ключей"
+
+  read answer?"Продолжить? (y/n)"
+  if [ "$answer" != "y" ]; then return 999; fi
+
+  # Определить
+
+  if [ -z "$node" ]
+  then
+    key_name=$LOCAL_NODE
+    key_path=$SECURITY_HOMEDIR
+  else
+    key_name=$node
+    key_path=$SECURITY_HOMEDIR/$node
+  fi
+
+  # Очистить каталог ключей
+
+  if [ -d $key_path ]
+  then
+    rm -f $key_path/*.gpg
+    rm -f $key_path/*.gpg~
+    rm -f $key_path/random_seed
+  else
+    mkdir -p $key_path
+  fi
+
+  # Сгенерировать пару ключей
+
+  security_genkey $key_name $key_path
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Генерация пары ключей для узла \"$key_name\" прошла успешно"
+    return 0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка генерации пары ключей для узла \"$key_name\""
+    return 999
+  fi
+}
+
+# ********************************************************************
+# keyring_export - Процедура исполнения команды keyring export
+# --------------
+# Параметры:
+
+keyring_export()
+{
+  typeset key_name key_path key_file
+
+  key_name=$LOCAL_NODE
+  key_path=$SECURITY_HOMEDIR
+  key_file=$key_name.$EXT_PUBKEY
+
+  security_exportkey $key_name $key_path $key_file
+
+  return $?
+}
+
+# ********************************************************************
+# keyring_add - Процедура исполнения команды keyring add
+# -----------
+# Параметры:
+#   keyfile - файл - открытый ключ
+
+keyring_add()
+{
+  typeset keyfile keyname
+
+  keyfile=$1
+  keyname=${keyfile%.$EXT_PUBKEY}
+
+  # Проверить, задан ли файл ключа и существует ли он
+
+  if [ -z "$keyfile" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Не указан файл открытого ключа"
+    return 999
+  fi
+
+  if [ ! -f $keyfile ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Указанный файл открытого ключа ($keyfile) не найден"
+    return 999
+  fi
+
+  # Добавить открытый ключ в кольцо доверия
+
+  security_addkey $keyname $SECURITY_HOMEDIR $keyfile
+  return $?
+}
+
+# ********************************************************************
+# keyring_remove - Процедура исполнения команды keyring remove
+# --------------
+# Параметры:
+#   keyname - имя открытого ключа
+
+keyring_remove()
+{
+  typeset keyname
+
+  keyname=$1
+
+  security_removekey $keyname $SECURITY_HOMEDIR
+  return $?
+}
+
+# ********************************************************************
+# keyring_list - Процедура исполнения команды keyring list
+# ------------
+# Параметры:
+
+keyring_list()
+{
+  security_listkeys $SECURITY_HOMEDIR
+  return $?
+}
+
+# ********************************************************************
+# security_genkey - Сгенерировать пару ключей
+# ---------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором будет создана пара
+
+security_genkey()
+{
+  typeset name path
+  typeset tmpfile
+
+  name=$1
+  path=$2
+
+  # Сформировать файл параметров ключей
+
+  tmpfile=$PATH_TEMP/gpg.key_param
+  echo \
+"
+    Key-Type: DSA
+    Key-Length: 1024
+    Subkey-Type: ELG-E
+    Subkey-Length: 1024
+    Name-Real: $name
+    Expire-Date: 0
+    %commit
+" > $tmpfile
+
+  # Сгенерировать пару ключей
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --gen-key $tmpfile \
+      2> $PATH_TEMP/gpg-out.genkey
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Генерация пары ключей в каталог \"$path\" прошла успешно"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка генерации пары ключей в каталог \"$path\". См \"$PATH_TEMP/gpg-out.genkey\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_exportkey - Экспортировать открытый ключ
+# ------------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находиться пара ключей
+#   file   - файл, в который будет записан открытый ключ
+
+security_exportkey()
+{
+  typeset name path file
+
+  name=$1
+  path=$2
+  file=$3
+
+  gpg --batch --quiet --no-permission-warning \
+      --armor --homedir $path --export $name > $file \
+      2> $PATH_TEMP/gpg-out.export
+
+  return $?
+}
+
+# ********************************************************************
+# security_addkey - Добавить открытый ключ в кольцо доверия
+# ---------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находиться ключи системы
+#   file   - файл, в котором находится открытый ключ
+
+security_addkey()
+{
+  typeset name path file
+  typeset -i status
+
+  name=$1
+  path=$2
+  file=$3
+
+  # Добавить ключ в свое кольцо открытых ключей
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --import $file 2> $PATH_TEMP/gpg-out.addkey
+
+  let status=$?
+
+  # Подписать ключ своим ключом
+
+  if [ $status -eq 0 ]
+  then
+    gpg --batch --no-permission-warning \
+        --homedir $path --yes --lsign-key $name \
+        2>> $PATH_TEMP/gpg-out.addkey
+
+    let status=$?
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# security_removekey - Удалить открытый ключ в кольца доверия
+# ------------------
+# Параметры:
+#   name   - имя ключа
+#   path   - каталог, в котором находяться ключи
+
+security_removekey()
+{
+  typeset path
+
+  name=$1
+  path=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $path --yes --delete-key $name
+
+  return $?
+}
+
+# ********************************************************************
+# security_listkeys - Вывести список открытых ключей
+# -----------------
+# Параметры:
+#   path   - каталог, в котором находяться ключи
+
+security_listkeys()
+{
+  typeset path
+
+  path=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --armor --homedir $path --list-public-keys
+
+  return $?
+}
+
+# ********************************************************************
+# security_level - Получить из конф. файла уровень безопасности
+#                  пакетов для данного узла
+# --------------
+# Параметры:
+#   type   - тип уровня безопасности пакетов
+#   node   - удаленный узел
+
+security_level()
+{
+  typeset type node
+  typeset ret conffile config str
+  typeset -i colon
+
+  type=$1
+  node=$2
+
+  ret=$SEC_LEVEL0
+  conffile=$PATH_ETCS/$FILENAME_NODES_SEC
+
+  if [ -f $conffile ]
+  then
+
+    if [ "$type" = "$SEC_DIRECTION_OUT" ]
+    then
+      let colon=2
+    else
+      let colon=3
+    fi
+
+    config="`cat $conffile | awk '($0 != "") && (substr($1, 1, 1) != "#") { print $0 }'`"
+
+    str="`echo "$config" | awk '($1 == "default") { print $col }' col=$colon`"
+    if [ -n "$str" ]; then ret=$str; fi
+
+    str="`echo "$config" | awk '($1 == "'$node'") { print $col }' col=$colon`"
+    if [ -n "$str" ]; then ret=$str; fi
+
+  fi
+
+  if inlist "$ret" "$SEC_LEVEL0 $SEC_LEVEL1 $SEC_LEVEL2"
+  then
+    true
+  else
+    logmsg $ST_ERR 1 0 $0 "В файле \"$conffile\" указан недопустимый уровень безопасности \"$ret\" для узла \"$node\" или для \"default\""
+    ret=999
+  fi
+
+  logmsg $ST_INFO 3 0 $0 "Для узла \"$node\" уровень безопасности \"$ret\""
+  echo $ret
+}
+
+# ********************************************************************
+# security_sign - Подписать файл
+# -------------
+# Параметры:
+#   file   - имя файла
+
+security_sign()
+{
+  typeset file
+
+  file=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --output $file.$EXT_SIGNATURE \
+      --detach-sign $file
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" подписан"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка подписи файла \"$file\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_encrypt - Зашифровать файл
+# ----------------
+# Параметры:
+#   node   - удаленный узел-получатель
+#   file   - имя файла
+
+security_encrypt()
+{
+  typeset node file
+
+  node=$1
+  file=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --recipient $node \
+      --output $file.$EXT_ENCRYPT \
+      --encrypt $file
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" зашифрован для получателя \"$node\""
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка шифрования файла \"$file\" для получателя \"$node\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_verify - Проверить подпись.
+#                   Подписанный файл должен находится в том же каталоге,
+#                   что файл-подпись, но без расширения .sig
+# ---------------
+# Параметры:
+#   file   - имя файла-подписи
+
+security_verify()
+{
+  typeset file
+
+  file=$1
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --trust-model always \
+      --verify $file 2>> $PATH_TEMP/gpg-out.verify
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Подпись файла \"$file\" достоверна"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка проверки подписи файла \"$file\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# security_decrypt - Расшифровать файл
+# ----------------
+# Параметры:
+#   inpfile   - имя зашифрованного файла
+#   outfile   - имя расшифрованного файла
+
+security_decrypt()
+{
+  typeset inpfile outfile
+
+  inpfile=$1
+  outfile=$2
+
+  gpg --batch --quiet --no-permission-warning \
+      --homedir $SECURITY_HOMEDIR \
+      --skip-verify \
+      --output $outfile \
+      --decrypt $inpfile
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$file\" расшифрован"
+    return 0
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка расшифровки файла \"$inpfile\""
+    return 1
+  fi
+}
+
+# ********************************************************************
+# node_add - Процедура исполнения команды node add
+# --------
+# Параметры:
+#   node - имя удаленного узла
+
+node_add()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, не существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Удаленный узел с таким именем уже существует"
+    return 999
+  fi
+
+  # Добавить удаленный узел в систему
+
+  add_node $node
+  return $?
+}
+
+# ********************************************************************
+# add_node - Добавить удаленный узел в систему
+# --------
+# Параметры:
+#   node - имя удаленного узла
+
+
+add_node()
+{
+  typeset node path_node sql
+  typeset -i status
+
+  node=$1
+
+  # Создать дерево каталогов для узла, если это необходимо
+
+  make_node_folder $node
+
+  # Добавить узел в базу данных
+
+  sql="$(replace "$SQL_NODE_ADD" "<node>" $node)"
+  exec_sql SQL_NODE_ADD "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Узел \"$node\" успешно добавлен в систему"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при добавлении узла \"$node\" в систему"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# make_node_folder - Создать каталог для удаленного узла
+# ----------------
+# Параметры:
+#   node - имя удаленного узла
+
+
+make_node_folder()
+{
+  typeset node path_node sql
+
+  node=$1
+
+  # Создать дерево каталогов для узла, если это необходимо
+
+  path_node=$PATH_NODES/$node
+  if [ ! -d $PATH_NODES ]; then mkdir $PATH_NODES; fi
+  if [ ! -d $path_node ]; then mkdir $path_node; fi
+  if [ ! -d $path_node/$FOLDER_INBOX ]; then mkdir $path_node/$FOLDER_INBOX; fi
+  if [ ! -d $path_node/$FOLDER_OUTBOX ]; then mkdir $path_node/$FOLDER_OUTBOX; fi
+
+  # Установить права на файлы и каталоги
+
+  chown -R $REMOTE_USER $path_node
+  chmod -R 770 $path_node
+}
+
+# ********************************************************************
+# node_remove - Процедура исполнения команды node remove
+# -----------
+# Параметры:
+#   node - имя удаленного узла
+
+node_remove()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    remove_node $node
+    let status=$?
+  else
+    logmsg $ST_ERR 1 1 $0 "Не существует удаленного узла с таким именем"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# remove_node - Удалить удаленный узел из системы
+# -----------
+# Параметры:
+#   node - имя удаленного узла
+#
+# Удаляется только информация об узле из базы данных.
+# Файлы и каталоги соответствующего узла остаются.
+
+remove_node()
+{
+  typeset node sql
+  typeset -i status
+
+  node=$1
+
+  sql="$(replace "$SQL_NODE_REMOVE" "<node>" $node)"
+  exec_sql SQL_NODE_REMOVE "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Данные об узле \"$node\" успешно удалены из системы"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при удалении из системы данных об узле \"$node\""
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# node_reset - Процедура исполнения команды node reset
+# ----------
+# Параметры:
+#   node - имя удаленного узла
+
+node_reset()
+{
+  typeset node
+  typeset -i status
+
+  node=$1
+
+  # Проверить, существует ли узел с таким именем в БД
+
+  is_registered_node $node
+  let status=$?
+
+  if [ $status -eq 999 ]; then return 999; fi
+
+  if [ $status -eq 0 ]
+  then
+    reset_node $node
+    let status=$?
+  else
+    logmsg $ST_ERR 1 1 $0 "Не существует удаленного узла с таким именем"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# reset_node - Очистить очередь исходящих пакетов и начать заново
+#              формировать пакеты для узла
+# ----------
+# Параметры:
+#   node - имя удаленного узла
+
+reset_node()
+{
+  typeset node sql
+
+  node=$1
+
+  # Сбросить в ноль номер последнего успешно сформированного пакета
+  # для данного узла
+
+  sql="$(replace "$SQL_PACKET_PREPARED_SET" "<node>" $node)"
+  sql="$(replace "$sql" "<number>" 0)"
+  exec_sql SQL_PACKET_PREPARED_SET "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Номер успешно сформированного пакета в БД успешно сброшен в ноль"
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при изменении в БД номера успешно сформированного пакета"
+    return 999
+  fi
+
+  # Очистить очередь исходящих пакетов для данного узла
+
+  logmsg $ST_INFO 3 0 $0 "Удаление всех пакетов из очереди исходящих пакетов для данного узла"
+  rm -f $PATH_NODES/$node/$FOLDER_OUTBOX/${PACKET_PREFIX}*.tgz
+  return $?
+}
+
+# ********************************************************************
+# node_list - Процедура исполнения команды node list
+# ---------
+
+node_list()
+{
+  typeset list
+
+  list="$(nodelist)"
+  if [ "$list" = "$SQL_ERROR" ]; then return 1; fi 
+  echo "$list"
+}
+
+# ********************************************************************
+# table_add - Процедура исполнения команды table add
+# ---------
+# Параметры:
+#   tablename - имя таблицы
+
+table_add()
+{
+  typeset tablename owner table sql
+  typeset -i status
+
+  tablename=$1
+
+  owner=$(table_owner $tablename)
+  table=$(table_name $tablename)
+
+  if [ -z "$owner" -o -z "$table" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <точное имя владельца>.<точное название таблицы>"
+    return 999
+  fi
+
+  # Включить таблицу в процесс синхронизации
+
+  update_table $owner $table add
+  return $?
+}
+
+# ********************************************************************
+# table_update - Процедура исполнения команды table update
+# ------------
+# Параметры:
+#   tablename - имя таблицы
+
+table_update()
+{
+  typeset tablename owner table sql
+  typeset -i status
+
+  tablename=$1
+
+  owner=$(table_owner $tablename)
+  table=$(table_name $tablename)
+
+  if [ -z "$owner" -o -z "$table" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <точное имя владельца>.<точное название таблицы>"
+    return 999
+  fi
+
+  # Обновить для синхронизации метаданные таблицы
+
+  update_table $owner $table update
+  return $?
+}
+
+# ********************************************************************
+# update_table - Добавить/обновить для синхронизации метаданные таблицы
+# ------------
+# Параметры:
+#   owner  - владелец таблицы
+#   table  - имя таблицы
+#   action - "add" или "update"
+
+update_table()
+{
+  typeset owner table action
+  typeset sql_template msg_ok msg_err
+  typeset sql fields all_fields all_fields_def all_values change_fields
+  typeset -i status
+
+  owner=$1
+  table=$2
+  action=$3
+
+  if [ "$action" = "add" ]
+  then
+    sql_template="$SQL_TABLE_ADD"
+    msg_ok="Таблица \"$owner.$table\" успешно включена в процесс синхронизации"
+    msg_err="Ошибка при включении таблицы \"$owner.$table\" в процесс синхронизации"
+
+  elif [ "$action" = "update" ]
+  then
+    sql_template="$SQL_TABLE_UPDATE"
+    msg_ok="Метаданные таблицы \"$owner.$table\" успешно обновлены"
+    msg_err="Ошибка при обновлении метаданных таблицы \"$owner.$table\""
+
+  else
+    logmsg $ST_ERR 1 0 $0 "Неизвестный тип действия \"$action\""
+    return 1
+  fi
+
+  # Проверить наличие у таблицы первичного ключа
+
+  fields="$(fieldlist $owner $table pkey)"
+  if [ "$fields" = "$SQL_ERROR" ]; then return 1; fi
+  if [ -z "$fields" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "У таблицы не определен первичный ключ"
+    return 999
+  fi
+
+  fields="$(fieldlist $owner $table all)"
+  if [ "$fields" = "$SQL_ERROR" ]; then return 1; fi
+
+  all_fields="$(list_to_str "$fields" ", " '"' '"')"
+  all_values="$SQL_FIELDPREFIX3.$(list_to_str "$fields" ", $SQL_FIELDPREFIX3." '"' '"')"
+  all_fields_def="$(fields_def $owner $table '*')"
+  change_fields="old_values.$(list_to_str_ex "$fields" " <> new_values." " or old_values."  '"'  '"'  '"'  '"')"
+
+  sql="$(replace "$sql_template" "<owner>" $owner)"
+  sql="$(replace "$sql" "<table>" $table)"
+  sql="$(replace "$sql" "<all_values>" "$all_values")"
+  sql="$(replace "$sql" "<all_fields>" "$all_fields")"
+  sql="$(replace "$sql" "<all_fields_def>" "$all_fields_def")"
+  sql="$(replace "$sql" "<change_fields>" "$change_fields")"
+  exec_sql SQL_TABLE_$action "$sql"
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "$msg_ok"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "$msg_err"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# fields_def - Вернуть строку определения полей таблицы в синтаксисе
+#              SQL-оператора create table
+# ----------
+# Параметры:
+#   owner    - владелец таблицы
+#   table    - название таблицы
+#   fields   - список полей; '*' - все поля
+
+fields_def()
+{
+  typeset owner table fields
+  typeset createclause
+  typeset sql all_fields fieldinfo
+  typeset field_name field_type field_size1 field_size2
+  typeset field_def
+  typeset -i add_field_flag
+
+  owner=$1
+  table=$2
+  fields="$(upper "$3")"
+
+  # Получить метаданные всех полей
+
+  sql=$(replace "$SQL_FIELDLIST_META" "<owner>" "$owner")
+  sql=$(replace "$sql" "<table>" "$table")
+  all_fields="$(sql_valuelist SQL_FIELDLIST_META "$sql")"
+  if [ "$all_fields" = "$SQL_ERROR" ]; then return 1; fi 
+
+  # Отфильтровать поля и сформировать строку определения полей
+
+  for fieldinfo in $all_fields
+  do
+    field_name=`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $1}'`
+    field_type=`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $3}'`
+    field_size1=`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $4}'`
+    field_size2=`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $5}'`
+
+    # -- Определить SQL-тип поля по коду типа в метаданных
+
+    field_type="\$type_${field_type}"
+    field_type="`eval echo $field_type`"
+
+    # -- Добавить к определению типа размер поля, если необходимо
+
+    case $(lastsymbol $field_type) in
+      ',')  field_type="${field_type%,}$field_size1,$field_size2)";;
+      '(')  field_type="${field_type}${field_size1})";;
+    esac
+
+    # -- Сформировать строку определения поля в выражении create table
+
+    field_def="\"${field_name}\" ${field_type}, "
+
+    # -- Определить, включать ли определение поля в итоговую строку
+
+    if [ "$fields" = '*' ]
+    then
+      let add_field_flag=1
+    elif inlist $(upper $field_name) "$fields"
+    then
+      let add_field_flag=1
+    else
+      let add_field_flag=0
+    fi
+
+    # -- Добавить определение поля в итоговую строку
+
+    if [ add_field_flag -eq 1 ]
+    then
+      createclause="${createclause}${field_def}"
+    fi
+
+  done
+
+  echo "${createclause%, }"
+}
+
+# ********************************************************************
+# table_remove - Процедура исполнения команды table remove
+# ------------
+# Параметры:
+#   tablename - имя таблицы
+
+table_remove()
+{
+  typeset tablename owner table
+  typeset -i status
+
+  tablename=$1
+
+  owner=$(table_owner $tablename)
+  table=$(table_name $tablename)
+
+  if [ -z "$owner" -o -z "$table" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <точное имя владельца>.<точное название таблицы>"
+    return 999
+  fi
+
+  remove_table $owner $table
+  return $?
+}
+
+# ********************************************************************
+# remove_table - Удалить из системы данные о таблице
+# ------------
+# Параметры:
+#   owner - владелец таблицы
+#   table - имя таблицы
+
+remove_table()
+{
+  typeset owner table sql
+  typeset -i status
+
+  owner=$1
+  table=$2
+
+  sql="$(replace "$SQL_TABLE_REMOVE" "<owner>" $owner)"
+  sql="$(replace "$sql" "<table>" $table)"
+  exec_sql SQL_TABLE_REMOVE "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Данные о таблице \"$owner.$table\" успешно удалены из системы"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при удалении из системы данных о таблице \"$owner.$table\""
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# table_dwatch-on - Процедура исполнения команды table dwatch-on
+# ---------------
+# Параметры:
+#   tablename - имя таблицы
+
+table_dwatch-on()
+{
+  typeset tablename owner table sql
+
+  tablename=$1
+
+  owner=$(table_owner $tablename)
+  table=$(table_name $tablename)
+
+  if [ -z "$owner" -o -z "$table" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <точное имя владельца>.<точное название таблицы>"
+    return 999
+  fi
+
+  # Включить механизм слежения за удалением записей из таблицы
+
+  dwatch_on $owner $table
+  return $?
+}
+
+# ********************************************************************
+# dwatch_on - Включить слежение за удалением записей из таблицы
+# ---------
+# Параметры:
+#   owner - владелец таблицы
+#   table - имя таблицы
+
+dwatch_on()
+{
+  typeset owner table
+  typeset sql fields all_fields all_fields_def all_values
+  typeset -i status
+
+  owner=$1
+  table=$2
+
+  fields="$(fieldlist $owner $table all)"
+  if [ "$fields" = "$SQL_ERROR" ]; then return 1; fi
+
+  all_fields="$(list_to_str "$fields" ", " '"' '"')"
+  all_values="$SQL_FIELDPREFIX3.$(list_to_str "$fields" ", $SQL_FIELDPREFIX3." '"' '"')"
+  all_fields_def="$(fields_def $owner $table '*')"
+
+  sql="$(replace "$SQL_WATCHDELETE_ADD" "<owner>" $owner)"
+  sql="$(replace "$sql" "<table>" $table)"
+  sql="$(replace "$sql" "<all_values>" "$all_values")"
+  sql="$(replace "$sql" "<all_fields>" "$all_fields")"
+  sql="$(replace "$sql" "<all_fields_def>" "$all_fields_def")"
+  exec_sql SQL_WATCHDELETE_ADD "$sql"
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Слежение за удалением записей из таблицы \"$owner.$table\" включено"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при включении механизма слежения за удалением записей из таблицы \"$owner.$table\""
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# table_dwatch-off - Процедура исполнения команды table dwatch-off
+# ----------------
+# Параметры:
+#   tablename - имя таблицы
+
+table_dwatch-off()
+{
+  typeset tablename owner table
+  typeset -i status
+
+  tablename=$1
+
+  owner=$(table_owner $tablename)
+  table=$(table_name $tablename)
+
+  if [ -z "$owner" -o -z "$table" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <точное имя владельца>.<точное название таблицы>"
+    return 999
+  fi
+
+  dwatch-off $owner $table
+  return $?
+}
+
+# ********************************************************************
+# dwatch-off - Выключить слежение за удалением записей таблицы
+# ----------
+# Параметры:
+#   owner - владелец таблицы
+#   table - имя таблицы
+
+dwatch-off()
+{
+  typeset owner table sql
+  typeset -i status
+
+  owner=$1
+  table=$2
+
+  sql="$(replace "$SQL_WATCHDELETE_REMOVE" "<owner>" $owner)"
+  sql="$(replace "$sql" "<table>" $table)"
+  exec_sql SQL_WATCHDELETE_REMOVE "$sql"
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Слежение за удалением записей из таблицы \"$owner.$table\" выключено"
+    let status=0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при выключении механизма слежения за удалением записей из таблицы \"$owner.$table\""
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# data_prepare - Процедура исполнения команды data prepare
+# ------------
+# Параметры:
+#   "for" - служебное слово
+#   group - имя группы или удаленного узла
+
+data_prepare()
+{
+  typeset group 
+  typeset -i status
+
+  group=$2
+
+  prepare_process $group
+  let status=$?
+
+  return $status
+}
+
+# ********************************************************************
+# prepare_process - Процесс исполнения команды data prepare
+# ---------------
+# Параметры:
+#   group - имя группы или удаленного узла
+
+prepare_process()
+{
+  typeset group 
+  typeset node list
+  typeset -i status
+
+  group=$1
+
+  # Если не указан узел-адресат
+
+  if [ -z "$group" ]
+  then
+    # Подготовить данные для всех зарегистрированных в системе узлов
+
+    list="$(nodelist)"
+    if [ "$list" = "$SQL_ERROR" ]; then return 1; fi 
+
+    for node in $list
+    do
+      prepare_data $node
+      if [ $? -ne 0 ]; then return 999; fi
+    done
+  else
+    # ...Иначе подготовить данные для узла или группы узлов
+
+    list="`$PATH_BASE/nodeconf $group nodelist`"
+    if [ -z "$list" ]; then return 1; fi 
+
+    for node in $list
+    do
+      # Проверить, существует ли узел в БД
+
+      is_registered_node $node
+      let status=$?
+
+      if [ $status -eq 999 ]; then return 999; fi
+
+      if [ $status -eq 0 ]
+      then
+        prepare_data $node
+        if [ $? -ne 0 ]; then return 999; fi
+      else
+        logmsg $ST_ERR 1 1 $0 "Узел \"$node\" не зарегистрирован в системе"
+        return 999
+      fi
+    done
+  fi
+  return 0
+}
+
+# ********************************************************************
+# prepare_data - Подготовка локальных данных для отправки на удаленный
+#                узел
+# ------------
+# Параметры:
+#   node  - имя удаленного узла
+
+prepare_data()
+{
+  typeset node node_num
+  typeset this this_num
+  typeset packet_info packet_version
+  typeset tablename owner table
+  typeset alias_owner alias_table
+  typeset tables tables_info
+  typeset all_fields pkey_fields other_fields select_fields_real
+  typeset real_fields_conf other_fields_conf virtual_fields_conf
+  typeset select_fields insert_fields insert_values fields_def
+  typeset special_fields select_special
+  typeset virtual_fields_list virtual_fields_sql
+  typeset path_out file_data file_del
+  typeset hash_config cache_file
+  typeset condition sql script
+  typeset last_str number_str
+  typeset -i last number isview seclevel
+  typeset -i maxblocktables blocktables isopenblock
+
+  node=$1
+  this=$LOCAL_NODE
+
+  node_num=`echo $node | sed -n 's/^[^0-9]*\([0-9]*\)[^0-9]*$/\1/p'`
+  this_num=`echo $this | sed -n 's/^[^0-9]*\([0-9]*\)[^0-9]*$/\1/p'`
+
+  logmsg $ST_INFO 3 0 $0 "Начать подготовку данных для узла \"$node\""
+
+  # Определить путь для выходных файлов и базовое имя для кэш-файлов
+
+  path_out=$PATH_NODES/$node/$FOLDER_OUTBOX
+  cache_file=$PATH_NODES/$node/$CACHE_PREPARE_BASE
+
+  # Определить, необходимо ли заново формировать SQL-скрипт
+  # подготовки данных
+
+  # -- Определить хеш-значение конфигурации узла из конфигурационного файла
+
+  hash_config="$(get_hash "`nodeconf $node config`")"
+
+  # -- Проверить наличие скрипта в кэше и совпадение хеш-значений
+
+  if [ -f $cache_file.$CACHE_PREPARE_HASH -a \
+       -f $cache_file.$CACHE_PREPARE_INFO  -a \
+       -f $cache_file.$CACHE_PREPARE_SQL  -a \
+       "`cat $cache_file.$CACHE_PREPARE_HASH 2> /dev/null`" = "$hash_config" ]
+  then
+
+    # Взять из кэша описания таблиц и SQL-скрипт подготовки данных
+
+    tables_info="`cat $cache_file.$CACHE_PREPARE_INFO`"
+    script="`cat $cache_file.$CACHE_PREPARE_SQL`"
+
+    logmsg $ST_INFO 3 0 $0 "SQL-скрипт и строка описания таблиц взяты из кэша"
+
+  else
+    # Иначе сформировать SQL-скрипт и строку описания таблиц
+
+    script="$(replace "$SQL_DATA_PREPARE_BEFORE" "<node>" "$node")"
+    tables_info=""
+
+    # -- Получить из конфига синхры максимальное количество таблиц в блоке
+
+    maxblocktables=${SQL_MAX_TABLES-$SQL_MAX_TABLES_DEFAULT}
+
+    # -- Получить список таблиц из конфигурационного файла для данного узла
+
+    tables="`$PATH_BASE/nodeconf $node tablelist`"
+    if [ $? -ne 0 ]; then return 1; fi 
+
+    let blocktables=0
+
+    for tablename in $tables 
+    do
+      owner=$(table_owner $tablename)
+      table=$(table_name $tablename)
+
+      if [ -z "$owner" -o -z "$table" ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Неправильно указана таблица. Правильный формат: <имя владельца>.<название таблицы>"
+        return 999
+      fi
+
+      alias="`$PATH_BASE/nodeconf $node tablealias for $tablename`"
+      alias_owner=$(table_owner $alias)
+      alias_table=$(table_name $alias)
+
+      # ---- Определить, представление это или таблица
+
+      if is_view $owner $table
+      then
+        let isview=1
+      else
+        if [ $? -eq 999 ]; then return 1; fi
+        let isview=0
+        if is_enabled_table $owner $table
+        then
+          :
+        else
+          logmsg $ST_ERR 1 1 $0 "Таблица \"$owner.$table\", указанная в конфигурационном файле не включена в процесс синхронизации"
+          return 999
+        fi
+      fi
+
+      # ---- Получить список неключевых полей из конфигурационного файла
+      #      для данной таблицы по данному узлу. Внимание! Названия
+      #      всех полей приводятся к верхнему регистру (в nodeconf).
+
+      other_fields_conf="`$PATH_BASE/nodeconf $node fieldlist for $owner.$table`"
+
+      # ---- Получить список ключевых полей таблицы, определенных
+      #      в конфигурационном файле специальным образом
+
+      pkey_fields="`echo "$other_fields_conf" | sed -ne "s/[^}]*{\([^}]*\)}.*/\1/p"`"
+      pkey_fields="$(sortlist "$pkey_fields")"
+
+      if [ -n "$pkey_fields" ]
+      then
+        # ---- Убрать из списка полей, указанных в конф. файле ключевые поля,
+        #      определенных специальным образом
+
+        other_fields_conf="`echo "$other_fields_conf" | sed -ne "s/\([^}]*\){[^}]*}\(.*\)/\1\2/p"`"
+        other_fields_conf="${other_fields_conf# }"
+        other_fields_conf="${other_fields_conf% }"
+
+      else
+        # ---- Получить список ключевых полей таблицы из метаданных БД
+        #      (в сортированном виде) привести к верхнему регистру
+
+        pkey_fields="$(fieldlist $owner $table pkey)"
+
+        if [ "$pkey_fields" = "$SQL_ERROR" ]; then return 1; fi
+        pkey_fields="$(upper "$pkey_fields")"
+      fi
+
+      if [ -z "$pkey_fields" ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Таблица \"$owner.$table\" не имеет первичного ключа"
+        return 999
+      fi
+
+      # ---- Разбить список неключевых полей на два списка:
+      #        - список обычных полей
+      #        - список виртуальных полей
+
+      real_fields_conf="$(real_fields "$other_fields_conf")"
+      virtual_fields_conf="$(virtual_fields "$other_fields_conf")"
+      virtual_fields_list="$(virtual_fields_list "$virtual_fields_conf")"
+
+      # ---- Если указано, что все поля, то взять список неключевых полей
+      #      из метаданных БД (в сортированном виде) и привести его к
+      #      верхнему регистру
+
+      if [ "$real_fields_conf" = '*' ]
+      then
+        other_fields="$(fieldlist $owner $table other)"
+        if [ "$other_fields" = "$SQL_ERROR" ]; then return 1; fi
+        other_fields="$(upper "$other_fields")"
+      else
+        # ---- Иначе, из списка из конфигурационного файла убрать
+        #      ключевые поля и отсортировать его
+
+        other_fields="$(removelist "$pkey_fields" from "$real_fields_conf")"
+        other_fields="$(sortlist "$other_fields")"
+      fi
+
+      # ---- Сформировать список выбираемых реальных полей из таблицы
+
+      select_fields_real="$pkey_fields $other_fields"
+
+      # ---- Убрать из списка реальных полей виртуальные поля (т.е. виртуальные
+      #      поля могут "заменять" в выборке любые реальные поля)
+
+      select_fields_real="$(removelist "$virtual_fields_list" from "$select_fields_real")"
+
+      # ---- Добавить метаданные о таблице в строку описания таблиц
+
+      tables_info="${tables_info}\n$(tableinfo $owner $table $alias_owner $alias_table "$pkey_fields" "$select_fields_real" "$virtual_fields_conf")"
+
+      # ---- Определить строку определения полей
+
+      load_table_metadata "$tables_info" $alias_owner $alias_table
+      fields_def="$(value_by_name $PACKINFO_TABLE_CREATE)"
+
+      # ---- Преобразовать списки полей в SQL-формат для подстановки в шаблон
+
+      all_fields="$select_fields_real $virtual_fields_list"
+
+      insert_fields="$(list_to_str "$all_fields" "," '"' '"')"
+      insert_values="$(list_to_str "$all_fields" ",$SQL_FIELDPREFIX2")"
+      insert_values="${SQL_FIELDPREFIX2}${insert_values}"
+
+      virtual_fields_sql="$(virtual_fields_sql "$virtual_fields_conf" "$SQL_FIELDPREFIX1")"
+      virtual_fields_sql="${virtual_fields_sql:+",$virtual_fields_sql"}"
+      select_fields_real="$(list_to_str_ex "$select_fields_real" " as $SQL_FIELDPREFIX1" "," '"' '"')"
+      select_fields="${select_fields_real}${virtual_fields_sql}"
+
+
+      # ---- Добавить дополнительное условие на выбоку данных из таблицы
+
+      condition="$($PATH_BASE/nodeconf $node condition for $owner.$table)"
+      condition="${condition:+"and ($condition)"}"
+ 
+      # ---- Определить имена и пути выходных файлов
+
+      file_data=$path_out/${alias_owner}${DATAFILE_SEPARATOR}${alias_table}.${EXT_DATFILE}
+      file_del=$path_out/${alias_owner}${DATAFILE_SEPARATOR}${alias_table}.${EXT_DELFILE}
+
+      # ---- Произвести все замены в шаблоне на фактические значения
+      #      (кроме номера формируемого пакета)
+
+      if [ $isview -eq 0 ]
+      then
+        sql="$SQL_DATA_PREPARE_TABLE"
+
+      else
+        special_fields="$(fieldlist $owner $table special)"
+        select_special="$(list_to_str_ex "$special_fields" " as $SQL_FIELDPREFIX1" "," '"' '"')"
+
+        str_chg=""
+        str_upd=""
+
+        for specfield in $special_fields
+        do
+          str_chg="${str_chg:+$str_chg or}$(replace "$SQL_DATA_PREPARE_VIEW_IF" "<special_field>" "$specfield")\n"
+          str_upd="${str_upd}\n$(replace "$SQL_DATA_PREPARE_VIEW_UPDATE" "<special_field>" "$specfield")"
+        done
+
+        sql="$SQL_DATA_PREPARE_VIEW"
+        sql="$(replace "$sql" "<select_special>" "$select_special")"
+        sql="$(replace "$sql" "<changed_special>" "$str_chg")"
+        sql="$(replace "$sql" "<update_special>" "$str_upd")"
+      fi
+
+      sql="$(replace "$sql" "<owner>" "$owner")"
+      sql="$(replace "$sql" "<table>" "$table")"
+      sql="$(replace "$sql" "<filter>" "$condition")"
+      sql="$(replace "$sql" "<file_data>" "$file_data")"
+      sql="$(replace "$sql" "<file_del>" "$file_del")"
+      sql="$(replace "$sql" "<node>" "$node")"
+      sql="$(replace "$sql" "<fields_def>" "$fields_def")"
+      sql="$(replace "$sql" "<select_fields>" "$select_fields")"
+      sql="$(replace "$sql" "<insert_fields>" "$insert_fields")"
+      sql="$(replace "$sql" "<insert_values>" "$insert_values")"
+      sql="$(replace "$sql" "<SENDER_NAME>" "$this")"
+      sql="$(replace "$sql" "<SENDER_NUMBER>" "$this_num")"
+      sql="$(replace "$sql" "<RECEIVER_NAME>" "$node")"
+      sql="$(replace "$sql" "<RECEIVER_NUMBER>" "$node_num")"
+
+      # ---- Вставить начало блока, если необходимо
+
+      let blocktables=$blocktables+1
+      if [ $blocktables -eq 1 ]
+      then
+        script="${script}\n${SQL_DATA_PREPARE_BLOCK_BEG}\n"
+        let isopenblock=1
+      fi
+
+      # ---- Вставить выгрузку данных из таблицы или представления
+
+      script="${script}\n${sql}\n"
+
+      # ---- Вставить конец блока, если необходимо
+
+      if [ $blocktables -eq $maxblocktables ]
+      then
+        script="${script}\n${SQL_DATA_PREPARE_BLOCK_END}\n"
+        let isopenblock=0
+        let blocktables=0
+      fi
+
+    done
+
+    # Вставить конец блока, если необходимо
+
+    if [ $isopenblock -eq 1 ]
+    then
+      script="${script}\n${SQL_DATA_PREPARE_BLOCK_END}\n"
+    fi
+
+    # Вставить завершение SQL-скрипта подготовки данных
+
+    script="${script}\n${SQL_DATA_PREPARE_AFTER}"
+
+    # Сохранить в кэше строку описания таблиц и SQL-скрипт
+
+    echo "$hash_config" > $cache_file.$CACHE_PREPARE_HASH
+    echo "$tables_info" > $cache_file.$CACHE_PREPARE_INFO
+    echo "$script" > $cache_file.$CACHE_PREPARE_SQL
+
+  fi
+
+  # Удалить все служебные файлы и файлы данных
+
+  rm -f $SQL_COUNT_FILE
+  rm -f $path_out/$FILENAME_DATA
+  rm -f $path_out/$FILENAME_DATA_ENC
+  rm -f $path_out/$FILENAME_PACKINFO
+  rm -f $path_out/*.$EXT_SIGNATURE
+  rm -f $path_out/*.$EXT_DATFILE
+  rm -f $path_out/*.$EXT_DELFILE
+
+  # Выполнить SQL-скрипт (предварительно сжав его)
+
+  echo "$script" > $PATH_TEMP/prepare.sql
+  script="$(compress_sql "$script")"
+  logmsg $ST_INFO 3 0 $0 "SQL-скрипт подготовки данных начал выполняться..."
+  exec_sql 'SQL_DATA_PREPARE_*' "$script"
+  if [ $? -ne 0 ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Ошибка при выполнении SQL-скрипта подготовки данных"
+    return 999
+  fi
+
+  logmsg $ST_INFO 3 0 $0 "SQL-скрипт подготовки данных выполнился успешно"
+
+  # Проверить, есть ли данные для отправки
+
+  if [ ! -f $SQL_COUNT_FILE ]
+  then
+    logmsg $ST_INFO 1 0 $0 "Нет данных для пакета. Номер успешно сформированного пакета в БД для узла \"$node\" не изменился"
+  else
+
+    # Получить номер последнего успешно сформированного пакета
+
+    sql="$(replace "$SQL_PACKET_PREPARED_GET" "<node>" "$node")"
+    last_str="$(sql_valuelist SQL_PACKET_PREPARED_GET "$sql")"
+    if [ "$last_str" = "$SQL_ERROR" ]; then return 1; fi 
+    let last=$last_str
+    logmsg $ST_INFO 3 0 $0 "Номер последнего пакета: $last"
+
+    # Получить новый номер пакета
+
+    number_str="`cat $SQL_COUNT_FILE`"
+    let number=$number_str
+    logmsg $ST_INFO 3 0 $0 "Новый номер пакета: $number"
+
+    # Определить требуемый уровень безопасности для
+    # создаваемого пакета
+
+    let seclevel=$(security_level $SEC_DIRECTION_OUT $node)
+    if [ $seclevel -eq 999 ]
+    then
+      logmsg $ST_ERR 1 1 $0 "Ошибка при определении требуемого уровня безопасности исходящего пакета для узла \"$node\""
+      return 999
+    fi
+
+    # Создать файл описания пакета
+
+    if [ $seclevel -eq $SEC_LEVEL0 ]
+    then
+      packet_version="1.3"
+    else
+      packet_version="$PACKET_VER_MAJOR.$PACKET_VER_MINOR"
+    fi
+
+    packet_info="${PACKINFO_PACKET_SEC_LEVEL}=$seclevel\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_VER_PACKET}=$packet_version\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_VER_SYSTEM}='$SYSTEM_VER'\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_FROM}=$this\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_TO}=$node\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_NUMBER}=$number\n"
+    packet_info="${packet_info}${PACKINFO_PACKET_PREV}=$last\n"
+    packet_info="${GENERAL_SECTION_START}\n\n${packet_info}\n${GENERAL_SECTION_STOP}\n\n"
+    packet_info="${packet_info}${TABLES_SECTION_START}${tables_info}\n\n${TABLES_SECTION_STOP}\n"
+    echo "$packet_info" > $path_out/$FILENAME_PACKINFO
+
+    # Сформировать пакет
+
+    make_packet $seclevel $node $number
+    if [ $? -ne 0 ]
+    then
+      logmsg $ST_ERR 1 0 $0 "Ошибка при создании файла пакета"
+      return 999
+    fi
+
+    # Изменить в БД номер успешно сформированного пакета
+ 
+    sql="$(replace "$SQL_PACKET_PREPARED_SET" "<number>" $number)"
+    sql="$(replace "$sql" "<node>" "$node")"
+    exec_sql SQL_PACKET_PREPARED_SET "$sql"
+    if [ $? -ne 0 ]
+    then
+      logmsg $ST_ERR 1 1 $0 "Ошибка при изменении в БД номера успешно сформированного пакета"
+      return 999
+    fi
+
+    logmsg $ST_INFO 3 0 $0 "Номер успешно сформированного пакета в БД изменен успешно"
+
+    # Заархивировать пакет
+
+    $PATH_BASE/archive out-packet $number by $node
+  fi
+
+  # Удалить все служебные файлы и файлы данных
+
+  rm -f $SQL_COUNT_FILE
+  rm -f $path_out/$FILENAME_DATA
+  rm -f $path_out/$FILENAME_DATA_ENC
+  rm -f $path_out/$FILENAME_PACKINFO
+  rm -f $path_out/*.$EXT_SIGNATURE
+  rm -f $path_out/*.$EXT_DATFILE
+  rm -f $path_out/*.$EXT_DELFILE
+
+  return 0
+}
+
+# ********************************************************************
+# tableinfo - Вернуть данные о таблице в формате информационного
+#             файла пакета
+# ---------
+# Выходные данные:
+#   список ключевых полей  - реальные ключевые поля таблицы
+#   список остальных полей - реальные неключевые поля таблицы
+#                            плюс виртуальные поля, названия
+#                            которых не совпадют с названиями
+#                            реальных полей
+#   строка определения     - строка определения записи в формате
+#                            SQL-оператора create table
+#
+# Поля в строке определения перечисленны в следующем порядке:
+#
+# <список1><список2><список3>, где
+#   <список1> - реальные ключевые поля минус поля, совпадающие
+#               по названию с виртуальными полями
+#   <список2> - реальные неключевые поля минус поля, совпадающие
+#               по названию с виртуальными полями
+#   <список3> - все виртуальные поля
+#
+# Во всех списках поля отсортированы по алфавиту.
+#
+# Параметры:
+#   owner          - владелец таблицы
+#   table          - имя таблицы
+#   out_owner      - владелец таблицы на выходе
+#   out_table      - имя таблицы на выходе
+#   pkey_fields    - список ключевых полей таблицы
+#   select_fields  - список реальных ключевых и неключевых полей,
+#                    несовпадающих по названию с виртуальными полями,
+#                    по которым производится выборка из таблицы
+#   virtual_fields - нормализованный список виртуальных полей
+#
+
+tableinfo()
+{
+  typeset owner table out_owner out_table
+  typeset pkey_fields select_fields virtual_fields
+  typeset pkeyfields otherfields virtualfields
+  typeset createclause
+  typeset section_start section_stop
+
+  owner=$(upper $1)
+  table=$(upper $2)
+  out_owner=$(upper $3)
+  out_table=$(upper $4)
+  pkey_fields="$5"
+  select_fields="$6"
+  virtual_fields="$7"
+
+  # Нормализовать списки полей
+
+  pkeyfields="$(list_to_str "$pkey_fields" " ")"
+  selectfields="$(list_to_str "$select_fields" " ")"
+
+  # Сформировать список неключевых полей
+
+  otherfields="$selectfields $(virtual_fields_list "$virtual_fields")"
+  otherfields="${otherfields# }"
+  otherfields="$(removelist "$pkey_fields" from "$otherfields")"
+  otherfields="$(sortlist "$otherfields")"
+
+  # Сформировать строку определения полей
+
+  # -- Создать строку определения виртуальных полей
+
+  virtualfields="$(virtual_fields_def "$virtual_fields")"
+  virtualfields="${virtualfields:+", $virtualfields"}"
+
+  # -- Сформировать итоговую строку определения всех полей
+
+  createclause="$(fields_def $owner $table "$selectfields")"
+  createclause="${createclause}${virtualfields}"
+
+  # Переделать параметры и их значения в определения в синтаксисе sh
+
+  pkeyfields="${PACKINFO_TABLE_PKEYS}='${pkeyfields# }'"
+  otherfields="${PACKINFO_TABLE_OTHER}='${otherfields# }'"
+  createclause="${PACKINFO_TABLE_CREATE}='${createclause}'"
+
+  # Сформировать итоговую строку, описывающую таблицу.
+  # Внимание! Имя таблицы в секции должно быть ВСЕГДА
+  # написано заглавными буквами
+
+  section_start="$(replace "$TABLE_SECTION_START" "<owner>" "$out_owner")"
+  section_start="$(replace "$section_start" "<table>" "$out_table")"
+  section_stop="$TABLE_SECTION_STOP"
+  echo "\n${section_start}\n\n${pkeyfields}\n${otherfields}\n${createclause}\n\n${section_stop}\n"
+}
+
+# ********************************************************************
+# make_packet - Сформировать пакет
+# -----------
+# Параметры:
+#   seclevel - требуемый уровень безопасности пакета
+#   node     - удаленный узел
+#   number   - номер пакета
+#
+
+make_packet()
+{
+  typeset -i seclevel
+  typeset node curdir
+  typeset -i number status
+  typeset packet_path packet_file seclevel datafiles packetfiles
+
+  let seclevel=$1
+  node=$2
+  let number=$3
+
+  # Определить имя файла-пакета
+
+  packet_path=$PATH_NODES/$node/$FOLDER_OUTBOX
+  packet_file=$packet_path/$(pkt_filename_by_number $number).tgz
+
+  # "Затарить" и "загэзипить" файлы данных в файл-пакет.
+  # Внимание! Необходимо, чтобы в тарболе файлы были без путей.
+
+  curdir=`pwd`
+  cd $packet_path
+
+  datafiles="*.$EXT_DATFILE *.$EXT_DELFILE"
+
+  if [ $seclevel -eq $SEC_LEVEL0 ]
+  then
+    packetfiles="$FILENAME_PACKINFO $datafiles"
+  else
+    # Подписать информационный файл пакета
+
+    security_sign $FILENAME_PACKINFO
+    if [ $? -ne 0 ]
+    then
+      logmsg $ST_ERR 1 1 $0 "Ошибка при подписывании информационного файла пакета для узла \"$node\""
+      return 999
+    fi
+
+    # Создать тарбол с данными пакета и подписать его
+
+    tar c $datafiles 2> /dev/null | gzip > $FILENAME_DATA
+    if [ $? -ne 0 ]
+    then
+      logmsg $ST_ERR 1 1 $0 "Ошибка при создании тарболла с данными пакета для узла \"$node\""
+      return 999
+    fi
+
+    security_sign $FILENAME_DATA
+    if [ $? -ne 0 ]
+    then
+      logmsg $ST_ERR 1 1 $0 "Ошибка при подписывании файла данных пакета для узла \"$node\""
+      return 999
+    fi
+
+    # Сформировать список файлов, входящих в пакет
+
+    packetfiles="$FILENAME_PACKINFO $FILENAME_PACKINFO.$EXT_SIGNATURE"
+    packetfiles="$packetfiles $FILENAME_DATA.$EXT_SIGNATURE"
+
+    # Если требуется, зашифровать данные пакета
+
+    if [ $seclevel -eq $SEC_LEVEL2 ]
+    then
+      security_encrypt $node $FILENAME_DATA
+      if [ $? -ne 0 ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Ошибка при шифровании файла данных пакета для узла \"$node\""
+        return 999
+      fi
+      packetfiles="$packetfiles $FILENAME_DATA_ENC"
+    else
+      packetfiles="$packetfiles $FILENAME_DATA"
+    fi
+  fi
+
+  # Сформировать итоговый файл-пакет
+
+  tar c $packetfiles 2> /dev/null | gzip > $packet_file
+  let status=$?
+
+  cd $curdir
+
+  # Проверить на успешность формирования пакета 
+
+  if [ $status -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Пакет \"$packet_file\" сформирован успешно"
+    rm -f $packet_path/$FILENAME_DATA
+    rm -f $packet_path/$FILENAME_DATA_ENC
+    rm -f $packet_path/$FILENAME_PACKINFO
+    rm -f $packet_path/*.$EXT_SIGNATURE
+    rm -f $packet_path/*.$EXT_DATFILE
+    rm -f $packet_path/*.$EXT_DELFILE
+    return 0
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при создании пакета \"$packet_file\""
+    return 999
+  fi
+}
+
+# ********************************************************************
+# data_update - Процедура исполнения команды data update
+# -----------
+# Параметры:
+#   "from" - служебное слово
+#   group  - имя группы или удаленного узла
+#
+# Обновление базы данных данными, пришедших с удаленного узла.
+# Данная процедура может выполняться в офф-лайне.
+
+data_update()
+{
+  typeset group 
+  typeset -i status
+
+  group=$2
+
+  if [ -z "$group" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Не указан узел"
+    return 999
+  fi
+
+  update_process $group
+  let status=$?
+
+  return $status
+}
+
+# ********************************************************************
+# update_process - Процесс исполнения команды data update
+# --------------
+# Параметры:
+#   group  - имя группы или удаленного узла
+
+update_process()
+{
+  typeset group
+  typeset curdir nodelist packets packet_path packet_name packinfo
+  typeset -i status number
+
+  group=$1
+
+  curdir=`pwd`
+
+  nodelist="`$PATH_BASE/nodeconf $group nodelist`"
+  if [ -z "$nodelist" ]; then return 1; fi 
+
+  for node in $nodelist
+  do
+    # Проверить, существует ли узел с таким именем в БД
+
+    is_registered_node $node
+    let status=$?
+
+    if [ $status -eq 999 ]; then return 999; fi
+
+    if [ $status -eq 0 ]
+    then
+      logmsg $ST_INFO 3 0 $0 "Начать обновление данных из узла \"$node\""
+    else
+      logmsg $ST_ERR 1 1 $0 "Узел \"$node\" не зарегистрирован в системе"
+      return 999
+    fi
+
+    # Перейти в каталог с очередью пакетов
+
+    packet_path=$PATH_NODES/$node/$FOLDER_INBOX
+    cd $packet_path
+
+    # Проверить, есть ли пакеты для обработки
+
+    packets="`ls -1 ${PACKET_PREFIX}*.tgz 2> /dev/null`"
+    if [ "$packets" = "" ]
+    then
+      logmsg $ST_WARN 2 0 $0 "Нет пакетов для обработки с узла \"$node\""
+      continue
+    fi
+
+    # Удалить "остаточные" файлы
+
+    rm -f $FILENAME_DATA
+    rm -f $FILENAME_DATA_ENC
+    rm -f $FILENAME_PACKINFO
+    rm -f *.$EXT_SIGNATURE
+    rm -f *.$EXT_DATFILE
+    rm -f *.$EXT_DELFILE
+
+    # Обработать все пакеты в порядке возрастания их номеров.
+    # Если возникнет какая-либо ошибка, выйти из цикла со
+    # значением переменной status != 0
+
+    for packet_name in $packets
+    do
+      # Определить номер пакета
+      let number=$(pkt_number_by_filename $packet_name)
+
+      # Распаковать пакет
+
+      unpack_packet $packet_name
+      let status=$?
+      if [ $status -ne 0 ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Ошибка целостности пакета \"`pwd`/$packet_name\""
+        let status=999
+        break
+      fi
+
+      # Проверить состав пакета
+
+      compound_packet
+      let status=$?
+      if [ $status -ne 0 ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Ошибка в \"`pwd`/$packet_name\": неполный пакет или недостаточный уровень безопасности пакета"
+        let status=999
+        break
+      fi
+
+      # Проверить подлинность пакета
+
+      verify_packet
+      let status=$?
+      if [ $status -ne 0 ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Ошибка подлинности пакета \"`pwd`/$packet_name\""
+        let status=999
+        break
+      fi
+
+      # Считать информационный файл пакета в память
+
+      packinfo="`cat $FILENAME_PACKINFO`"
+
+      # Проверить пакет
+
+      valid_packet $node $number "$packinfo"
+      let status=$?
+
+      if [ $status -eq $RETURN_SKIP ]
+      then
+        logmsg $ST_INFO 1 0 $0 "Пакет "чужой" или ранее уже был успешно обработан. Пакет будет игнорирован (удален)"
+        let status=0
+      elif [ $status -ne 0 ]
+      then
+        logmsg $ST_ERR 1 1 $0 "Ошибка при выполнении функции проверки пакета \"`pwd`/$packet_name\""
+        let status=999
+        break
+      else
+
+        # Ошибок нет, обработать и заархивировать пакет
+
+        # -- Обновить базу данных данными из пакета
+ 
+        update_db $node $number "$packinfo"
+        let status=$?
+
+        # -- Заархивировать пакет
+
+        if [ $status -eq 0 ]
+        then
+          $PATH_BASE/archive in-packet $number by $node
+          let status=$?
+          if [ $status -ne 0 ]
+          then
+            logmsg $ST_ERR 1 0 $0 "Ошибка при архивировании пакета"
+          fi
+        fi
+      fi
+
+      # В случае успешной обработки и архивирования пакета
+      # или в случае игнорирования пакета:
+      #   1) удалить файлы данных
+      #   2) удалить пакет
+
+      if [ $status -eq 0 ]
+      then
+        rm -f $FILENAME_DATA
+        rm -f $FILENAME_DATA_ENC
+        rm -f $FILENAME_PACKINFO
+        rm -f *.$EXT_SIGNATURE
+        rm -f *.$EXT_DATFILE
+        rm -f *.$EXT_DELFILE
+        rm -f $packet_name 2> /dev/null
+
+      # ...Иначе прервать цикл обработки пакетов
+      else
+        logmsg $ST_ERR 1 0 $0 "Ошибка при обработке пакета \"`pwd`/$packet_name\""
+        break
+      fi
+
+    done
+
+  done
+
+  cd $curdir
+  return $status
+}
+
+# ********************************************************************
+# unpack_packet - Распаковать пакет в текущем каталоге 
+# -------------
+# Параметры:
+#   filename - имя файла-пакета (без путей)
+
+unpack_packet()
+{
+  typeset filename
+
+  filename="$1"
+
+  # "Разгэзипить" и "разтарить" пакет
+
+  zcat $filename 2> /dev/null | tar x 2> /dev/null
+
+  if [ $? -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Файл \"$filename\" распакован успешно"
+  else
+    logmsg $ST_ERR 1 0 $0 "Ошибка во время распаковки файла \"`pwd`/$filename\""
+    return 1
+  fi
+
+  return 0
+}
+
+# ********************************************************************
+# compound_packet - Проверить состав пакета.
+#                   Расшифровать, если необходимо, данные пакета.
+#                   Предполагается, что содержимое пакета находится
+#                   в текущем каталоге
+# ---------------
+# Параметры:
+
+compound_packet()
+{
+  typeset file
+  typeset -i status status1 status2
+
+  if [ ! -f $FILENAME_PACKINFO ]
+  then
+    logmsg $ST_ERR 1 0 $0 "В пакете отсутствует информационный файл \"$FILENAME_PACKINFO\""
+    let status=999
+    return 999
+  fi
+  return 0
+}
+
+# ********************************************************************
+# verify_packet - Проверить пакет на подлинность.
+#                 Предполагается, что содержимое пакета находится
+#                 в текущем каталоге
+# -------------
+# Параметры:
+
+verify_packet()
+{
+  typeset file
+  typeset -i status status1 status2
+
+  # Проверить подлинность информационнного файла пакета
+
+  file=$FILENAME_PACKINFO.$EXT_SIGNATURE
+
+  let status1=0
+  if [ -f $file ]
+  then
+    security_verify $file
+    let status1=$?
+
+    if [ $status1 -eq 0 ]
+    then
+      logmsg $ST_INFO 3 0 $0 "Информационный файл пакета является подлинным"
+    else
+      logmsg $ST_ERR 1 0 $0 "Ошибка подлинности информационного файла пакета"
+    fi
+  fi
+
+  # Проверить подлинность файла данных пакета
+
+  file=$FILENAME_DATA.$EXT_SIGNATURE
+
+  let status2=0
+  if [ -f $file ]
+  then
+    security_verify $file
+    let status2=$?
+
+    if [ $status2 -eq 0 ]
+    then
+      logmsg $ST_INFO 3 0 $0 "Файл данных пакета является подлинным"
+    else
+      logmsg $ST_ERR 1 0 $0 "Ошибка подлинности файла данных пакета"
+    fi
+  fi
+
+  let status=$status1+$status2
+  return $status
+}
+
+# ********************************************************************
+# valid_packet - Проверить пакет. Если все нормально, "проапгрейдить"
+#                содержимое пакета 
+# ------------
+# Параметры:
+#   node     - удаленный узел
+#   number   - номер пакета
+#   packinfo - метаданные пакета
+#
+
+valid_packet()
+{
+  typeset node packinfo sql prev_str
+  typeset -i number prev
+  typeset packet_version packet_from packet_to packet_number packet_prev
+  typeset version_major_str
+  typeset -i version_major
+
+  node=$1
+  let number=$2
+  packinfo="$3"
+
+  # Загрузить параметры пакета из метаданных пакета
+
+  load_packet_metadata "$packinfo"
+  packet_version="$(value_by_name $PACKINFO_PACKET_VER_PACKET)"
+  packet_from="$(value_by_name $PACKINFO_PACKET_FROM)"
+  packet_to="$(value_by_name $PACKINFO_PACKET_TO)"
+  packet_number="$(value_by_name $PACKINFO_PACKET_NUMBER)"
+  packet_prev="$(value_by_name $PACKINFO_PACKET_PREV)"
+
+  # Считать из базы данных номер последнего успешно обработанного пакета
+
+  sql="$(replace "$SQL_PACKET_UPDATED_GET" "<node>" "$node")"
+  prev_str="$(sql_valuelist SQL_PACKET_UPDATED_GET "$sql")"
+  if [ "$prev_str" = "$SQL_ERROR" ]; then return 1; fi 
+  let prev=$prev_str
+  logmsg $ST_INFO 3 0 $0 "Номер последнего успешно обработанного пакета: $prev"
+
+
+  # Проверить: версия формата пакета должна быть правильно определена
+  #            (если не указана, то считается, что пакет сгенерирован
+  #            старой версией системы, в которой отсутствовало понятие
+  #            версии формата пакета) и старший номер этой версии должен
+  #            быть не больше старшего номера версии формата пакета,
+  #            обрабатываемого текущей версией системы 
+
+  if [ -z "$packet_version" ]
+  then
+    logmsg $ST_WARN 1 0 $0 "Неизвестная версия формата пакета. Обработка пакета продолжена"
+  else
+    let version_major_str=`echo "$packet_version" | sed -n -e '/^\([1234567890]*\)\..*$/s//\1/p'`
+    if [ -z "$version_major_str" ]
+    then
+      log_msg $ST_ERR 1 0 $0 "Неправильный формат версии пакета: $packet_version"
+      return 1
+    fi
+    let version_major=$version_major_str
+    if [ version_major -gt $PACKET_VER_MAJOR ]
+    then
+      logmsg $ST_ERR 1 0 $0 "Старший номер версии формата пакета ($version_major) больше старшего номера версии формата пакета, обрабатываемого данной версией системы ($PACKET_VER_MAJOR)"
+      return 1
+    fi
+  fi
+
+  # Проверить: номер пакета, указанный в информационном файле пакета
+  #            должен совпадать с номером пакета, указанным в имени
+  #            файла пакета
+
+  if [ "$packet_number" != "$number" ]
+  then
+    logmsg $ST_ERR 1 0 $0 "Номер пакета, указанный в информационном файле пакета ($packet_number) не совпадает с номером в имени файла-пакета ($number)"
+    return 1
+  fi
+
+  # Проверить: получатель и отправитель, указанные в информационном
+  #            файле пакета должны соответствовать реальным получателю
+  #            и отправителю, указанному в командной строке
+
+  if [ "$packet_from" != "$node" ]
+  then
+    logmsg $ST_WARN 1 0 $0 "Чужой пакет: отправитель, указанный в информационном файле пакета ($packet_from) не совпадает с именем узла в чей очереди располагается пакет ($node)"
+    return $RETURN_SKIP
+  fi
+
+  if [ "$packet_to" != "$LOCAL_NODE" ]
+  then
+    logmsg $ST_WARN 1 0 $0 "Чужой пакет: получатель, указанный в информационном файле пакета ($packet_to) не совпадает с именем данного узла ($LOCAL_NODE)"
+    return $RETURN_SKIP
+  fi
+
+  # Проверить: ели номер данного пакета меньше или равен номеру
+  #            последнего успешно обработанного пакета, то считать,
+  #            что данный пакет уже успешно обработан и вернуть
+  #            специальное значение.
+  #            Одно исключение из этого правила: пакет должен быть
+  #            обработан, если номер предыдущего пакета равен нулю.
+  #            Такая ситуация возникает в случае обработки
+  #            первоначальных пакетов со сброшенной нумерацией.
+
+  if [ $number -le $prev -a \
+       $packet_prev -ne 0 ]
+  then
+    logmsg $ST_WARN 2 0 $0 "Данный пакет ($number) уже успешно обработан"
+    return $RETURN_SKIP
+  fi
+
+  # Проверить: номер предыдущего пакета, указанный в информационном
+  #            файле пакета должен совпадать с номером последнего
+  #            успешно обработанного пакета.
+  #            Одно исключение из этого правила: пакет считается
+  #            правильным, если номер предыдущего пакета равен нулю.
+  #            Необходимость в этом возникает в случае обработки
+  #            первоначальных пакетов.
+
+  if [ $packet_prev -ne $prev ]
+  then
+    if [ $packet_prev -eq 0 ]
+    then
+      logmsg $ST_WARN 2 0 $0 "Внимание! Начало или сброс цепочки пакетов с удаленного узла"
+    else
+      logmsg $ST_ERR 1 1 $0 "Разрыв цепочки пакетов: номер предыдущего пакета, указанный в информационном файле пакета ($packet_prev) не совпадает с номером последнего успешно обработанного пакета ($prev)"
+      return 1
+    fi
+  fi
+
+  # ...Иначе все в порядке
+
+  upgrade_packet "$packet_version"
+  return 0
+}
+
+# ********************************************************************
+# upgrade_packet - "Проапгрейдить" содержимое пакета до текущий версии
+# --------------
+# Параметры:
+#   packet_version - 
+#
+# При выполнении данной процедуры содержимое пакета находится в
+# текущем каталоге.
+
+upgrade_packet()
+{
+  typeset packet_version
+  typeset file_data
+
+  packet_version="$1"
+
+  case "$packet_version" in
+    "1.0")
+		for file_data in `ls -1 *.$EXT_DATFILE`
+		do
+		  touch ${file_data%.$EXT_DATFILE}.$EXT_DELFILE
+		done
+            ;;
+  esac
+}
+
+# ********************************************************************
+# update_db - Обновить БД данными из текущего каталога 
+# ---------
+# Параметры:
+#   node     - удаленный узел
+#   number   - номер пакета
+#   packinfo - метаданные пакета (для метаданных таблицы)
+
+update_db()
+{
+  typeset node packinfo
+  typeset -i number status
+
+  node=$1
+  let number=$2
+  packinfo="$3"
+
+  typeset tables file
+  typeset packinfo file_data file_del table_owner table_name common_fields
+  typeset select_fields insert_fields insert_values pkey_fields update_fields
+  typeset local_fields_pkey local_fields_other local_fields_all
+  typeset remote_fields_pkey remote_fields_other remote_fields_all
+  typeset remote_fields_def
+  typeset select_pkey
+  typeset sql script
+  typeset hash_packet cache_file
+  typeset local_fields_pkey_upper
+
+  # Получить список таблиц из файла описания пакета.
+  # Разделителем между владельцем и названием таблицы
+  # является знак DATAFILE_SEPARATOR
+
+  tables=`echo "$packinfo" | sed -ne "s/${TABLE_SECTION_SEARCH}/\1${DATAFILE_SEPARATOR}\2/p"`
+
+  # Определить, необходимо ли заново формировать SQL-скрипт
+  # в части обновления таблиц
+
+  # -- Определить хеш-значение описания таблиц из метаданных пакета
+
+  hash_packet="$(get_hash "$(get_tables_section "$packinfo")")"
+
+  # -- Проверить наличие скрипта в кэше и совпадение хеш-значений
+
+  cache_file=$PATH_NODES/$node/$CACHE_UPDATE_BASE
+
+  if [ -f $cache_file.$CACHE_UPDATE_HASH -a \
+       -f $cache_file.$CACHE_UPDATE_SQL  -a \
+       "`cat $cache_file.$CACHE_UPDATE_HASH 2> /dev/null`" = "$hash_packet" ]
+  then
+
+    # Считать скрипт их кэша
+
+    script="`cat $cache_file.$CACHE_UPDATE_SQL`"
+    logmsg $ST_INFO 3 0 $0 "SQL-скрипт в части обновления таблиц взят из кэша"
+
+  else
+    # Сформировать SQL-скрипт в части обновления таблиц
+
+    script=""
+
+    # -- Двигаться по таблицам из файла описания пакета
+
+    for table in $tables
+    do
+      table_owner=$(table_owner $table "$DATAFILE_SEPARATOR")
+      table_name=$(table_name $table "$DATAFILE_SEPARATOR")
+      file_data=${table_owner}_${table_name}.$EXT_DATFILE
+      file_del=${table_owner}_${table_name}.$EXT_DELFILE
+
+      # Загрузить метаданные таблицы из информационного файла
+      load_table_metadata "$packinfo" $table_owner $table_name
+
+      # Определить списки полей таблицы в удаленной БД
+
+      remote_fields_def="$(value_by_name $PACKINFO_TABLE_CREATE)"
+      remote_fields_pkey="$(value_by_name $PACKINFO_TABLE_PKEYS)"
+      remote_fields_other="$(value_by_name $PACKINFO_TABLE_OTHER)"
+      remote_fields_all="$remote_fields_pkey $remote_fields_other"
+
+      # Определить списки полей таблицы в локальной БД
+
+      local_fields_pkey="$(fieldlist $table_owner $table_name pkey)"
+      local_fields_other="$(fieldlist $table_owner $table_name other)"
+      local_fields_all="$(upper "$local_fields_pkey $local_fields_other")"
+
+      if [ -z "$local_fields_pkey" ]
+      then
+        logmsg $ST_ERR 1 1 $0 "В локальной БД у таблицы \"$table_owner.$table_name\" не определен первичный ключ"
+        return 999
+      fi
+
+      # Вычислить набор общих полей
+
+      common_fields=""
+      for item in $remote_fields_all
+      do
+        if inlist "$(upper "$item")" "$local_fields_all"
+        then
+          common_fields="$common_fields $item"
+        fi
+      done
+      common_fields="${common_fields# }"
+
+      # Вычислить поля, значения по которым могут обновляться.
+      # Это те поля, которые:
+      #   a) одновременно присутствуют в локальной и удаленной таблицах;
+      #   b) не входят в первичный ключ в локальной таблице.
+
+      update_fields=""
+      local_fields_pkey_upper="$(upper "$local_fields_pkey")"
+
+      for item in $common_fields
+      do
+        if inlist $(upper $item) "$local_fields_pkey_upper"
+        then
+          :
+        else
+          update_fields="$update_fields $item"
+        fi
+      done
+      update_fields="${update_fields# }"
+
+      # Привести значения параметров шаблона к соответствующим видам
+
+      select_fields="$(list_to_str_ex "$common_fields" " as $SQL_FIELDPREFIX1" ", " '"' '"')"
+      insert_fields="$(list_to_str "$common_fields" ", " '"' '"')"
+      insert_values="$(list_to_str "$common_fields" ", $SQL_FIELDPREFIX2")"
+      insert_values="${SQL_FIELDPREFIX2}${insert_values}"
+      pkey_fields="$(list_to_str_ex "$local_fields_pkey" " = $SQL_FIELDPREFIX2" " and " '"' '"')"
+      update_fields="$(list_to_str_ex "$update_fields" " = $SQL_FIELDPREFIX2" ", " '"' '"')"
+ 
+      # Произвести все замены в шаблоне на фактические значения
+
+      sql="$(replace "$SQL_DATA_UPDATE" "<owner>" "$table_owner")"
+      sql="$(replace "$sql" "<table>" "$table_name")"
+      sql="$(replace "$sql" "<fields_def>" "$remote_fields_def")"
+      sql="$(replace "$sql" "<select_fields>" "$select_fields")"
+      sql="$(replace "$sql" "<insert_fields>" "$insert_fields")"
+      sql="$(replace "$sql" "<insert_values>" "$insert_values")"
+      sql="$(replace "$sql" "<pkey_fields>" "$pkey_fields")"
+      sql="$(replace "$sql" "<update_fields>" "$update_fields")"
+      sql="$(replace "$sql" "<file_data>" "`pwd`/$file_data")"
+      sql="$(replace "$sql" "<file_del>" "`pwd`/$file_del")"
+
+      script="${script}\n${sql}\n"
+    done
+
+    # -- Сохранить хэш-значение и SQL-скрипт в части обновления таблиц в кэше
+
+    echo "$hash_packet" > $cache_file.$CACHE_UPDATE_HASH
+    echo "$script" > $cache_file.$CACHE_UPDATE_SQL
+    logmsg $ST_INFO 3 0 $0 "Сформированный SQL-скрипт в части обновления таблиц сохранен в кэше ($cache_file.$CACHE_UPDATE_SQL)"
+  fi
+
+  sql="$(replace "$SQL_DATA_UPDATE_AFTER" "<number>" $number)"
+  sql="$(replace "$sql" "<node>" "$node")"
+
+  script="${SQL_DATA_UPDATE_BEFORE}${script}${sql}"
+
+  # Создать пустыми недостающие в пакете файлы.
+  # Это требуется для безошибочного исполнения SQL-скрипта
+
+  for table in $tables
+  do
+    file=${table}.$EXT_DATFILE
+    if [ ! -r $file ]; then touch $file; fi
+    file=${table}.$EXT_DELFILE
+    if [ ! -r $file ]; then touch $file; fi
+  done
+
+  # Выполнить SQL-скрипт
+
+  echo "$script" > $PATH_TEMP/update.sql
+  logmsg $ST_INFO 3 0 $0 "SQL-скрипт обновления данных начал выполняться..."
+  exec_sql 'SQL_DATA_UPDATE_*' "$script"
+  let status=$?
+
+  if [ $status -eq 0 ]
+  then
+    logmsg $ST_INFO 3 0 $0 "SQL-скрипт обновления данных выполнился успешно"
+  else
+    logmsg $ST_ERR 1 1 $0 "Ошибка при выполнении SQL-скрипта обновления данных"
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# get_tables_section - Вернуть секцию описания всех таблиц из
+#                      метаданных пакета в виде строки
+# ------------------
+# Параметры:
+#   metadata - метаданные
+
+get_tables_section()
+{
+  typeset metadata section_start section_stop
+
+  metadata="$1"
+
+  section_start="$TABLES_SECTION_START"
+  section_stop="$TABLES_SECTION_STOP"
+  echo "$metadata" | awk "/^${section_start}\$/, /^$section_stop\$/"
+}
+
+# ********************************************************************
+# load_packet_metadata - Загрузить метаданные пакета в виде набора
+#                        переменных в область данных скрипта
+# --------------------
+# Параметры:
+#   metadata - метаданные
+
+load_packet_metadata()
+{
+  typeset metadata section_start section_stop section
+
+  metadata="$1"
+
+  section_start="$GENERAL_SECTION_START"
+  section_stop="$GENERAL_SECTION_STOP"
+  section="`echo "$metadata" | awk "/^$section_start\$/, /^$section_stop\$/"`"
+  eval "$section"
+}
+
+# ********************************************************************
+# load_table_metadata - Загрузить метаданные таблицы в виде набора
+#                       переменных в области данных скрипта
+# -------------------
+# Параметры:
+#   metadata - метаданные
+#   owner    - владелец таблицы
+#   table    - имя таблицы
+
+load_table_metadata()
+{
+  typeset metadata owner table section_start section_stop section
+
+  metadata="$1"
+  owner=$2
+  table=$3
+
+  section_start="$(replace "$TABLE_SECTION_START" "<owner>" $owner)"
+  section_start="$(replace "$section_start" "<table>" $table)"
+  section_stop="$TABLE_SECTION_STOP"
+  section="`echo "$metadata" | awk "/^$section_start\$/, /^$section_stop\$/"`"
+  eval "$section"
+}
+
+# ********************************************************************
+# prepared_get - Процедура исполнения команды prepared get
+# ------------
+# Параметры:
+#   "for"  - служебное слово
+#   node   - имя удаленного узла
+
+prepared_get()
+{
+  typeset node number
+
+  node=$2
+
+  sql="$(replace "$SQL_PACKET_PREPARED_GET" "<node>" $node)"
+  number="$(sql_valuelist SQL_PACKET_PREPARED_GET "$sql")"
+  if [ "$number" = "$SQL_ERROR" ]
+  then
+    echo Error
+    return 1
+  fi 
+  echo $number
+  return 0
+}
+
+# ********************************************************************
+# prepared_set - Процедура исполнения команды prepared set
+# ------------
+# Параметры:
+#   number - номер успешно отправленного пакета
+#   "for"  - служебное слово
+#   node   - имя удаленного узла
+
+prepared_set()
+{
+  typeset node
+  typeset -i number
+
+  let number=$1
+  node=$3
+
+  sql="$(replace "$SQL_PACKET_PREPARED_SET" "<node>" $node)"
+  sql="$(replace "$sql" "<number>" $number)"
+  exec_sql SQL_PACKET_PREPARED_SET "$sql"
+  return $?
+}
+
+# ********************************************************************
+# updated_get - Процедура исполнения команды updated get
+# -----------
+# Параметры:
+#   "for"  - служебное слово
+#   node   - имя удаленного узла
+
+updated_get()
+{
+  typeset node number
+
+  node=$2
+
+  sql="$(replace "$SQL_PACKET_UPDATED_GET" "<node>" $node)"
+  number="$(sql_valuelist SQL_PACKET_UPDATED_GET "$sql")"
+  if [ "$number" = "$SQL_ERROR" ]
+  then
+    echo Error
+    return 1
+  fi 
+  echo $number
+  return 0
+}
+
+# ********************************************************************
+# updated_set - Процедура исполнения команды updated set
+# -----------
+# Параметры:
+#   number - номер успешно отправленного пакета
+#   "for"  - служебное слово
+#   node   - имя удаленного узла
+
+updated_set()
+{
+  typeset node
+  typeset -i number
+
+  let number=$1
+  node=$3
+
+  sql="$(replace "$SQL_PACKET_UPDATED_SET" "<node>" $node)"
+  sql="$(replace "$sql" "<number>" $number)"
+  exec_sql SQL_PACKET_UPDATED_SET "$sql"
+  return $?
+}
+
+# ********************************************************************
+# nodelist - Вернуть список удаленных узлов, зарегистрированных 
+# --------   в системе
+
+nodelist()
+{
+  sql_valuelist SQL_NODELIST
+}
+
+# ********************************************************************
+# is_registered_node - Проверить, зарегистрирован ли в системе
+#                      удаленный узел
+# ------------------
+# Параметры:
+#   node  - имя удаленного узла
+
+is_registered_node()
+{
+  typeset node nodes
+  node=$1
+
+  nodes="$(nodelist)"
+  if [ "$nodes" = "$SQL_ERROR" ]
+  then
+    logmsg $ST_ERR 1 1 $0 "Ошибка базы данных"
+    return 999
+  fi 
+
+  if inlist $node "$nodes"
+  then
+    logmsg $ST_INFO 3 0 $0 "Узел \"$node\" зарегистрирован в системе"
+    return 0
+  else
+    logmsg $ST_INFO 3 0 $0 "Узел \"$node\" не зарегистрирован в системе"
+    return 1
+  fi
+}
+
+# ********************************************************************
+# tablelist - Вернуть список синхронизируемых таблиц 
+# ---------
+
+tablelist()
+{
+  sql_valuelist SQL_TABLELIST
+}
+
+# ********************************************************************
+# is_enabled_table - Проверить, включена ли таблица в процесс
+#                    синхронизации
+# ----------------
+# Параметры:
+#   owner - владелец таблицы
+#   table - имя таблицы
+
+is_enabled_table()
+{
+  typeset owner table
+  owner=$(upper $1)
+  table=$(upper $2)
+
+  if inlist "$owner.$table" "$(upper "$(tablelist)")"
+  then
+    logmsg $ST_INFO 3 0 $0 "Таблица \"$1.$2\" включена в процесс синхронизации"
+    return 0
+  else
+    logmsg $ST_INFO 3 0 $0 "Таблица \"$1.$2\" не включена в процесс синхронизации"
+    return 1
+  fi
+}
+
+# ********************************************************************
+# is_view - Проверить, является ли таблица представлением 
+# -------
+# Параметры:
+#   owner - владелец представления
+#   table - имя представления
+
+is_view()
+{
+  typeset owner table sql
+  owner=$(upper $1)
+  table=$(upper $2)
+
+  sql=$(replace "$SQL_ISVIEW" "<owner>" $owner)
+  sql=$(replace "$sql" "<table>" $table)
+
+  str="$(sql_valuelist 'SQL_ISVIEW' "$sql")"
+
+  if [ "$str" = "$SQL_ERROR" ]
+  then
+    echo "Ошибка базы данных"
+    return 999
+  fi 
+
+  if [ -n "$str" ]
+  then
+    logmsg $ST_INFO 3 0 $0 "Таблица \"$1.$2\" является представлением (view)"
+    return 0
+  else
+    logmsg $ST_INFO 3 0 $0 "Таблица \"$1.$2\" не является представлением (view)"
+    return 1
+  fi
+}
+
+# ********************************************************************
+# fieldlist - Вернуть список полей определенной таблицы
+# ---------
+# Параметры:
+#   owner     - владелец таблицы
+#   table     - название таблицы
+#   fieldtype - класс полей:
+#                 all     - все поля
+#                 pkey    - поля, входящие в первичный ключ
+#                 other   - поля, не входящие в первичный ключ
+#                 special - служебные поля (pkt_<name>) 
+
+fieldlist()
+{
+  typeset owner table fieldtype cond sql
+
+  owner=$1
+  table=$2
+  fieldtype="$3"
+
+  if [ "$fieldtype" = "all" ]
+  then
+    sql="$SQL_FIELDLIST"
+
+  elif [ "$fieldtype" = "special" ]
+  then
+    sql="$SQL_FIELDLIST_SPECIAL"
+
+  else
+    sql="$SQL_FIELDLIST_EX"
+    if [ "$fieldtype" = "pkey" ]; then cond="="; else cond="<>"; fi
+    sql=$(replace "$sql" "<equal_or_not>" "$cond")
+  fi
+
+  sql=$(replace "$sql" "<owner>" $owner)
+  sql=$(replace "$sql" "<table>" $table)
+
+  sql_valuelist 'SQL_FIELDLIST' "$sql"
+}
+
+# ********************************************************************
+# real_fields - Вернуть список реальных полей, указанных в строке
+# -----------
+# Параметры:
+#   fields_str - строка-список полей
+
+real_fields()
+{
+  set -f # необходимо, чтобы '*' не заменялась на имена файлов
+
+  typeset fields_str
+  typeset fields_list
+  typeset item
+
+  fields_str="$1"
+
+  for item in $fields_str
+  do
+    if [ -z "`echo "$item" | grep =`" ]
+    then
+      fields_list="$fields_list $item"
+    fi
+  done
+  echo "${fields_list# }"
+
+  set +f
+}
+
+# ********************************************************************
+# virtual_fields - Вернуть нормализованный список виртуальных полей,
+#                  указанных в строке-списке полей
+# --------------
+# Формат определения виртуального поля:     <поле>[<тип>]=<значение>
+# Формат нормализованного определения поля: <поле>---<тип>---<значение> 
+#
+# Поля сортируются по названию полей. Дублирующие поля удаляются из
+# списка.
+#
+# Параметры:
+#   fields_str - список виртуальных полей
+
+virtual_fields()
+{
+  set -f # необходимо, чтобы '*' не заменялась на имена файлов
+
+  typeset fields_str
+  typeset fields_def
+  typeset field_def
+  typeset pattern
+  typeset item
+
+  fields_str="$1"
+
+  pattern='\([a-zA-Z0-9_]*\)\[\([a-zA-Z0-9_()]*\)\]=\([^=]*\)'
+
+  for item in $fields_str
+  do
+    if [ -n "`echo "$item" | grep =`" ]
+    then
+      field_def="`echo "$item" | sed -n "s/$pattern/\1${SQL_FIELD_SEPARATOR}\2${SQL_FIELD_SEPARATOR}\3/p"`"
+      fields_def="${fields_def}\n${field_def}"
+    fi
+  done
+  echo "`echo "${fields_def#"\n"}" | sort -u -f -t${SQL_FIELD_SEPARATOR} -k0.0`"
+
+  set +f
+}
+
+# ********************************************************************
+# virtual_fields_def - Вернуть строку определения виртуальных полей
+#                      в синтаксисе SQL-оператора create table
+# ------------------
+# Формат выходной строки: "<поле>" <тип>[, ...]
+#
+# Параметры:
+#   fields - нормализованный список виртуальных полей
+
+virtual_fields_def()
+{
+  typeset fields
+  typeset output_str
+  typeset fieldinfo
+  typeset field_name field_type
+  typeset field_def
+
+  fields="$1"
+
+  for fieldinfo in $fields
+  do
+    field_name="`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $1}'`"
+    field_type="`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $2}'`"
+
+    field_def="\"${field_name}\" ${field_type}, "
+    output_str="${output_str}${field_def}"
+  done
+
+  echo "${output_str%, }"
+}
+
+# ********************************************************************
+# virtual_fields_sql - Вернуть строку определения виртуальных полей
+#                      в синтаксисе SQL-оператора select
+# ------------------
+# Формат выходной строки: <значение> as "[<префикс>]<поле>"[, ...]
+#
+# Параметры:
+#   fields - нормализованный список виртуальных полей
+#   prefix - необязательно. Префикс к названиям полей
+
+virtual_fields_sql()
+{
+  typeset fields
+  typeset prefix
+  typeset output_str
+  typeset fieldinfo
+  typeset field_name field_value
+  typeset field_def
+
+  fields="$1"
+  prefix="$2"
+
+  for fieldinfo in $fields
+  do
+    field_name="`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $1}'`"
+    field_value="`echo $fieldinfo | awk -v FS=$SQL_FIELD_SEPARATOR '{print $3}'`"
+
+    field_def="${field_value} as \"${prefix}${field_name}\", "
+    output_str="${output_str}${field_def}"
+  done
+
+  echo "${output_str%, }"
+}
+
+# ********************************************************************
+# virtual_fields_list - Вернуть список виртуальных полей
+# -------------------
+#
+# Параметры:
+#   fields - нормализованный список виртуальных полей
+
+virtual_fields_list()
+{
+  typeset fields="$1"
+
+  echo "$fields" | awk -v FS=$SQL_FIELD_SEPARATOR '{print $1}'
+}
+
+# ********************************************************************
+# exec_sql - Выполнить SQL-выражение
+# --------
+# Параметры:
+#   sqlname - имя переменной, хранящей SQL-выражение
+#   sql     - необязательно. Само SQL-выражение
+#
+# Если не задан второй аргумент, то SQL-выражение берется из
+# переменной, имя которой указанно в первом аргументе.
+
+exec_sql()
+{
+  typeset tmpfile errfile sql
+  typeset -i status
+
+  sqlname=$1
+  sql="$2"
+
+  if [ -x $SQL_EXEC ]
+  then
+    tmpfile=$PATH_TEMP/$$-exec_sql.sql
+    errfile=$PATH_TEMP/error_sql-$$.sql
+
+    if [ -z "$sql" ]
+    then
+      sql="$(value_by_name $sqlname)"
+      if [ -z "$sql" ]; then logmsg $ST_WARN 2 0 $0 "Пустое SQL-выражение"; fi
+    fi
+
+    echo "$sql" > $tmpfile
+
+    # Предполагается, что программа $SQL_EXEC возвращает код
+    # возврата, указывающий на успешность выполнения выражения
+
+    $SQL_EXEC $tmpfile 2> $errfile
+    let status=$?
+
+    if [ $status -eq 0 ]
+    then
+      logmsg $ST_INFO 3 0 $0 "SQL-выражение \"$sqlname\" выполнилось успешно"
+      rm -f $tmpfile
+      rm -f $errfile
+    else
+      cat $tmpfile >> $errfile
+      rm -f $tmpfile
+      logmsg $ST_ERR 1 0 $0 "Ошибка при выполнении SQL-выражения \"$sqlname\". Выражение сохранено в файле \"$errfile\""
+    fi
+
+  else
+    logmsg $ST_ERR 1 1 $0 "Программа \"$SQL_EXEC\" недоступна или не может быть выполнена"
+    let status=999
+  fi
+
+  return $status
+}
+
+# ********************************************************************
+# get_hash - Вернуть хеш-значение исходной строки
+# --------
+# Параметры:
+#   string - исходная строка
+
+get_hash()
+{
+  typeset string hash
+
+  string="$1"
+
+  hash="`printf "%s" "$string" | cksum | awk '{print $1}'`"
+  logmsg $ST_INFO 3 0 $0 "Хеш-значение: $hash"
+  echo "$hash"
+}
+
+# ********************************************************************
+
+typeset -i status
+
+# Сменить значение переменной окружения TMPDIR, чтобы корректно
+# отрабатывала утилита sort (без Permission denied)
+
+path_temp_old=$TMPDIR
+export TMPDIR=$PATH_TEMP
+
+logmsg $ST_INFO 1 0 "" "Начало выполнения команды \"$process_name $*\"..."
+
+main $*
+let status=$?
+
+export TMPDIR=$path_temp_old
+
+if [ $status -eq 0 ]
+then
+  logmsg $ST_INFO 1 0 "" "Команда \"$process_name $*\" успешно выполнена"
+  exit 0
+
+elif [ $status -eq $ERROR_BUSY ]
+then
+  exit 2
+
+else
+  logmsg $ST_INFO 1 0 "" "Команда \"`basename $0` $*\" выполнилась с ошибкой"
+
+  if [ $status -ne 999 ]
+  then
+    echo "Ошибка! Смотри лог-файл $LOG_FILE"
+  fi
+  exit 1
+fi

@@ -1,0 +1,43 @@
+######################################################################
+# Autor: Радимир Михайлов (radimir@mobilcard.ru)
+# Descr: Файл конфигурации узлов - для коммуникационного центра
+#                                  с поддержкой ФИЛИАЛОВ
+# -------------------------------------------------------------------
+# $Id $
+# -------------------------------------------------------------------
+######################################################################
+
+# === Groups ===
+
+# Группа: все филиалы
+
+group_offices="kemerovo barnaul"
+
+# ==============
+
+# === For nodes: offices
+
+# -- Справочники
+
+table_oc2_tEmitentsGT="Emitent EmitentName MarketCode"
+table_oc2_tDepartmentGT="DeptCode DeptName MarketCode"
+table_oc2_tMarketGT="MarketCode MarketName MarketShort Description"
+table_oc2_tTownGT="Dept Emitent TownCode TownName"
+condi_oc2_tTownGT="Dept != (select Dept from mcc.Nodes where Name = '<receiver_name>')"
+table_oc2_tAZSGT="Deprt Emitent AZSCode TownCode AZSComment"
+condi_oc2_tAZSGT="Dept != (select Dept from mcc.Nodes where Name = '<receiver_name>')"
+
+# -- Карты
+
+table_mcc_CardsGlobal="{CardNo} EmitentNo Dept UserPwd Arrested OrigArrested Banned CSC0Low CSC1Low CSC2Low CSC0High CSC1High CSC2High"
+condi_mcc_CardsGlobal="TranzDept = (select Dept from mcc.Nodes
+                                     where Name = '<receiver_name>')"
+alias_mcc_CardsGlobal="mcc.Cards"
+
+# -- Транзакции
+
+table_mcc_TransactionsLog="TransactionId PaymentType PaymentId TrkId GoodId Price RequestedVolume TransClosed TimePoint ShiftId AZSNo AZSEmit AZSDept CardEmit CardDept"
+condi_mcc_TransactionsLog="CardDept = (select Dept from mcc.Nodes
+                                        where Name = '<receiver_name>')"
+
+# ==============
